@@ -5,12 +5,13 @@ MT5 executes, PostgreSQL remembers every decision including every decision
 not to trade. Full design in [`docs/specs/`](docs/specs/) - start with
 [`SPEC-00-overview.md`](docs/specs/SPEC-00-overview.md).
 
-## Status: MVP build, Phases 0-4 of 8
+## Status: MVP build, Phases 0-4 of 8 done, Phase 5 partial
 
 This build covers **Foundation, Domain & persistence, the Strategy engine,
-the Research engine (backtester), and Paper execution** - the parts
-buildable and testable without a live broker, an MT5 terminal, or weeks of
-demo trading. See
+the Research engine (backtester), and Paper execution** to their full
+acceptance criteria, plus the MT5-facing half of **Phase 5 (the MT5
+bridge)** - built and live-verified on a separate Windows host against a
+real FTMO-Demo account once one became available. See
 [`docs/adr/0001-mvp-scope.md`](docs/adr/0001-mvp-scope.md) for exactly what
 that means and every deviation from the spec, and
 [`docs/specs/SPEC-10-build-plan.md`](docs/specs/SPEC-10-build-plan.md) for
@@ -29,11 +30,15 @@ it dispatches, fills, opens a position, gets managed (breakeven, partial
 take-profits, ATR trailing, time exit), closes, and lands as a trade
 record - with idempotent, crash-recoverable dispatch (the outbox pattern)
 and a reconciler that never auto-closes a position it doesn't recognise.
-**What doesn't exist yet:** a connection to a real broker. There is no
-Windows agent, no MT5 terminal, no live quote feed, and
-`GLOBAL_TRADING_ENABLED` has no effect on anything - everything above runs
-against synthetic bar data and a fake broker (see the ADR for exactly what
-that stands in for and what it doesn't).
+Separately again, `agent/mt5_client.py` can place, modify, close and read
+orders/positions/deals against a **real** MT5 terminal and a real broker
+demo account - live-verified, not simulated.
+**What doesn't exist yet:** the two halves above aren't connected. There is
+no deployed backend for the agent's WSS transport to reach, no
+reconnection replay, and `GLOBAL_TRADING_ENABLED` has no effect on
+anything - the paper-execution lifecycle above still runs against a fake
+broker, and the live-verified MT5 client still runs standalone with its
+transport disabled (see the ADR for the full breakdown).
 
 | Phase | Status |
 |---|---|
@@ -42,7 +47,7 @@ that stands in for and what it doesn't).
 | 2 Strategy engine | ✅ Done |
 | 3 Research engine | ✅ Done (synthetic data only - see ADR) |
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
-| 5 MT5 bridge | Not started - needs a real Windows/MT5 host |
+| 5 MT5 bridge | 🟡 Partial - MT5-facing half live-verified; no backend/WSS yet - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
 | 7 Terminal | Not started |
 | 8 Demo, then live | Not started |
@@ -64,7 +69,11 @@ backend/          FastAPI app: domain/, engines/, research/, execution/, models/
   app/api/         FastAPI routes (currently: /system/health, /ready, /status).
   migrations/      Alembic, one initial schema migration.
   tests/           unit/, integration/ (real Postgres+Redis), golden/ (engine fixtures)
-agent/, ea/, frontend/, infra/nginx/, infra/prometheus/, docs/runbooks/
+agent/            MT5 execution agent (SPEC-04 §8), Python 3.12, standalone package.
+                   mt5_client.py + store.py: implemented, live-verified, unit-tested.
+                   transport.py/executor.py/watcher.py/heartbeat.py/health.py/main.py:
+                   scaffolded and wired, not yet connected to a real backend - see the ADR.
+ea/, frontend/, infra/nginx/, infra/prometheus/, docs/runbooks/
                    Stubbed per docs/specs/SPEC-00 §5. Not implemented - see the ADR.
 docs/specs/        The full spec set this was built from.
 docs/adr/          Architecture decision records.
@@ -95,11 +104,15 @@ make down
 ## Verifying it
 
 ```bash
-make check   # lint, mypy --strict on domain/engines, import-linter, purity grep, tests
+make check         # backend: lint, mypy --strict on domain/engines, import-linter, purity grep, tests
+make agent-check   # agent: lint, mypy, tests (all against a fake MT5 module - no terminal needed)
 ```
 
-- **342 tests**, unit + integration (against real Postgres/Redis) + golden
-  engine fixtures.
+- **342 backend tests** (unit + integration against real Postgres/Redis +
+  golden engine fixtures) plus **31 agent tests**, all running against a
+  fake `MetaTrader5` module (`agent/tests/fake_mt5.py`) so they run
+  anywhere - `MetaTrader5` itself is a Windows-only dependency and is never
+  imported in CI.
 - **93% overall branch coverage**, **100% on `engines/risk/`** (SPEC-10
   Phase 2's explicit bar).
 - `mypy --strict` clean on `domain/` and `engines/`; `mypy` clean on the rest.
@@ -132,14 +145,33 @@ finished:
 
 ## Next steps
 
-Per `SPEC-10`, the next build increment is **Phase 5 (the MT5 bridge)** -
-and it cannot happen in this environment at all. It needs a Windows host
-running a real MetaTrader5 terminal and a real broker demo account; nothing
-about that can be substituted. `app/execution/` was built so that Phase 5's
-job is narrow: implement `SimulatedBroker`'s command/event surface
-(`place_order`, `modify_position`, `close_position`, `get_positions`,
-`get_deals`) against a real WSS-connected agent. The dispatcher, event
-consumer, position manager and reconciler should not need to change.
+Per `SPEC-10`, the current build increment is **Phase 5 (the MT5 bridge)**.
+`app/execution/` was built so Phase 5's job would be narrow: implement
+`SimulatedBroker`'s command/event surface against a real agent -
+`agent/mt5_client.py` now does exactly that, live-verified against an
+FTMO-Demo account; the dispatcher, event consumer, position manager and
+reconciler didn't need to change. What's left to finish Phase 5:
+
+1. **Deploy the backend somewhere the agent can reach it** - a Windows host
+   running MT5 and a Linux host running this backend need to be two
+   separate machines connected over a network (`MetaTrader5` is
+   Windows-only and IPC-based; it can't run on Linux). Nothing in Phase 5
+   can be fully validated without this.
+2. **Test `agent/transport.py`'s connect/reconnect loop** against a real or
+   mocked WSS server - handshake success, a rejected handshake (bad
+   signature/stale timestamp/reused nonce per SPEC-04 §2), disconnect
+   mid-session, and the backoff sequence. Currently untested against any
+   server.
+3. **Implement reconnection replay** (SPEC-04 §7.2-§7.4): on reconnect,
+   replay the local event queue from the last acked `event_id`, then send a
+   full position snapshot and a deal batch covering the disconnected window
+   with 5-minute overlap. `agent/store.py` has the primitives
+   (`unacked_events`/`ack_event`); nothing calls them on reconnect yet.
+4. **Add tests for `executor.py`, `watcher.py`, `heartbeat.py`,
+   `health.py`, `main.py`** - currently wired but unverified beyond import
+   and manual reasoning.
+5. **Rate limiting/backpressure** on the heartbeat and the `event.quote`
+   throttle (SPEC-04 §5's 4/sec max) - not implemented.
 
 Two things remain open on the research side, independent of Phase 5:
 `SPEC-07` §8's v1 experiment needs to run against real XAUUSD history

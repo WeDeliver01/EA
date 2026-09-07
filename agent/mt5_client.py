@@ -14,13 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, TypeVar
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:  # pragma: no cover - MetaTrader5 is Windows-only
+    # Not testable on this platform beyond import: `MT5Client` methods that
+    # touch a real terminal will simply fail with AttributeError if called
+    # without either a real Windows MT5 package or a monkeypatched `mt5`
+    # (see tests/fake_mt5.py, which is what every test uses instead).
+    mt5 = None  # type: ignore[assignment]
 
 from agent.models import (
     AccountSnapshot,
@@ -45,12 +53,26 @@ LOCAL_UNSUPPORTED_ORDER_TYPE = -5
 _SYMBOL_FILLING_FOK = 1  # SYMBOL_FILLING_MODE bitmask, not exposed as a constant
 _SYMBOL_FILLING_IOC = 2  # by the MetaTrader5 package - values per MQL5 docs.
 
-_SIDE_TO_MT5 = {OrderSide.BUY: mt5.ORDER_TYPE_BUY, OrderSide.SELL: mt5.ORDER_TYPE_SELL}
-_MT5_DEAL_SIDE = {mt5.DEAL_TYPE_BUY: OrderSide.BUY, mt5.DEAL_TYPE_SELL: OrderSide.SELL}
+# MT5 order/deal/position type constants - stable per the MQL5 API and
+# mirrored exactly in tests/fake_mt5.py. Hardcoded (rather than read off
+# `mt5.*`) so this module is importable without the Windows-only
+# MetaTrader5 package installed.
+_MT5_ORDER_TYPE_BUY = 0
+_MT5_ORDER_TYPE_SELL = 1
+_MT5_DEAL_TYPE_BUY = 0
+_MT5_DEAL_TYPE_SELL = 1
+_MT5_POSITION_TYPE_BUY = 0
+_MT5_POSITION_TYPE_SELL = 1
+
+_SIDE_TO_MT5 = {OrderSide.BUY: _MT5_ORDER_TYPE_BUY, OrderSide.SELL: _MT5_ORDER_TYPE_SELL}
+_MT5_DEAL_SIDE = {_MT5_DEAL_TYPE_BUY: OrderSide.BUY, _MT5_DEAL_TYPE_SELL: OrderSide.SELL}
 _MT5_POSITION_SIDE = {
-    mt5.POSITION_TYPE_BUY: OrderSide.BUY,
-    mt5.POSITION_TYPE_SELL: OrderSide.SELL,
+    _MT5_POSITION_TYPE_BUY: OrderSide.BUY,
+    _MT5_POSITION_TYPE_SELL: OrderSide.SELL,
 }
+
+
+_T = TypeVar("_T")
 
 
 class MT5Error(RuntimeError):
@@ -138,7 +160,7 @@ class MT5Client:
 
     # -- executor plumbing ----------------------------------------------------
 
-    async def _run(self, fn, *args: Any):
+    async def _run(self, fn: Callable[..., _T], *args: Any) -> _T:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, fn, *args)
 
@@ -246,10 +268,10 @@ class MT5Client:
 
     def _resolve_filling_mode(self, filling_mode_bitmask: int) -> int:
         if filling_mode_bitmask & _SYMBOL_FILLING_FOK:
-            return mt5.ORDER_FILLING_FOK
+            return int(mt5.ORDER_FILLING_FOK)
         if filling_mode_bitmask & _SYMBOL_FILLING_IOC:
-            return mt5.ORDER_FILLING_IOC
-        return mt5.ORDER_FILLING_RETURN
+            return int(mt5.ORDER_FILLING_IOC)
+        return int(mt5.ORDER_FILLING_RETURN)
 
     def _local_reject(
         self, cmd: PlaceOrderCommand, *, retcode: int, retcode_text: str
@@ -301,9 +323,7 @@ class MT5Client:
 
         tick = mt5.symbol_info_tick(cmd.symbol)
         if tick is None:
-            return self._local_reject(
-                cmd, retcode=LOCAL_SYMBOL_UNAVAILABLE, retcode_text="NO_TICK"
-            )
+            return self._local_reject(cmd, retcode=LOCAL_SYMBOL_UNAVAILABLE, retcode_text="NO_TICK")
         price = tick.ask if cmd.side is OrderSide.BUY else tick.bid
 
         stops_level = int(info.trade_stops_level) * Decimal(str(info.point))
@@ -414,9 +434,7 @@ class MT5Client:
     ) -> ModifyResult:
         position = self._get_position(int(broker_position_id))
         if position is None:
-            return ModifyResult(
-                broker_position_id, retcode=10036, retcode_text="NO_POSITION"
-            )
+            return ModifyResult(broker_position_id, retcode=10036, retcode_text="NO_POSITION")
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "symbol": position.symbol,

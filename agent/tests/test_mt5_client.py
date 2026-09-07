@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -37,8 +38,8 @@ async def client(fake: FakeMT5) -> MT5Client:
     return c
 
 
-def place_cmd(**overrides) -> PlaceOrderCommand:
-    base = {
+def place_cmd(**overrides: Any) -> PlaceOrderCommand:
+    base: dict[str, Any] = {
         "client_order_id": "01JCXG",
         "symbol": "XAUUSD",
         "side": OrderSide.BUY,
@@ -78,9 +79,7 @@ class TestPlaceOrderPreflight:
         assert result.retcode == LOCAL_NOT_CONNECTED
         assert fake.order_send_calls == []
 
-    async def test_non_market_order_rejects_locally(
-        self, fake: FakeMT5, client: MT5Client
-    ) -> None:
+    async def test_non_market_order_rejects_locally(self, fake: FakeMT5, client: MT5Client) -> None:
         cmd = place_cmd(order_type=OrderType.LIMIT, limit_price=Decimal("100"))
         result = await client.place_order(cmd)
         assert result.retcode == LOCAL_UNSUPPORTED_ORDER_TYPE
@@ -135,8 +134,12 @@ class TestPlaceOrderFill:
         )
         fake.history_deals = [
             make_deal(
-                ticket=888, order=555, position_id=555,
-                type=fake.DEAL_TYPE_BUY, entry=fake.DEAL_ENTRY_IN, price=100.12,
+                ticket=888,
+                order=555,
+                position_id=555,
+                type=fake.DEAL_TYPE_BUY,
+                entry=fake.DEAL_ENTRY_IN,
+                price=100.12,
             )
         ]
         result = await client.place_order(place_cmd())
@@ -197,6 +200,7 @@ class TestClosePosition:
         fake.symbols["XAUUSD"] = make_symbol()
         fake.order_send_result = make_order_result(retcode=fake.TRADE_RETCODE_DONE, volume=0.01)
         fill = await client.close_position("555", max_slippage_points=30, volume=Decimal("0.01"))
+        assert fill is not None
         assert fill.deal_type.value == "PARTIAL_EXIT"
         assert fake.order_send_calls[-1]["volume"] == 0.01
 
@@ -251,8 +255,11 @@ class TestGetDeals:
     async def test_filters_non_trade_deal_types(self, fake: FakeMT5, client: MT5Client) -> None:
         fake.history_deals = [
             make_deal(
-                ticket=1, order=1, position_id=1,
-                type=fake.DEAL_TYPE_BUY, entry=fake.DEAL_ENTRY_IN,
+                ticket=1,
+                order=1,
+                position_id=1,
+                type=fake.DEAL_TYPE_BUY,
+                entry=fake.DEAL_ENTRY_IN,
             ),
             make_deal(ticket=2, order=2, position_id=1, type=fake.DEAL_TYPE_BALANCE, entry=0),
         ]
@@ -288,8 +295,12 @@ class TestGetDeals:
         deal_broker_time = frozen_now + timedelta(hours=1, minutes=5)
         fake.history_deals = [
             make_deal(
-                ticket=1, order=1, position_id=1, type=fake.DEAL_TYPE_BUY,
-                entry=fake.DEAL_ENTRY_IN, time=int(deal_broker_time.timestamp()),
+                ticket=1,
+                order=1,
+                position_id=1,
+                type=fake.DEAL_TYPE_BUY,
+                entry=fake.DEAL_ENTRY_IN,
+                time=int(deal_broker_time.timestamp()),
             )
         ]
         deals = await client.get_deals()

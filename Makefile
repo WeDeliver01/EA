@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate check lint typecheck imports purity test test-unit test-integration test-golden coverage fmt
+.PHONY: up down logs migrate check lint typecheck imports purity test test-unit test-integration test-golden coverage fmt agent-lint agent-typecheck agent-test agent-check
 
 COMPOSE = docker compose -f infra/docker-compose.yml --env-file .env
 
@@ -53,3 +53,15 @@ coverage:
 
 check: lint typecheck imports purity test
 	@echo "All checks passed."
+
+agent-lint:
+	cd agent && ruff check . && ruff format --check .
+
+agent-typecheck:
+	cd agent && mypy .
+
+agent-test:
+	cd agent && pytest -q
+
+agent-check: agent-lint agent-typecheck agent-test
+	@echo "Agent checks passed."

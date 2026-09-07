@@ -34,6 +34,13 @@ system - nothing in this codebase is connected to a broker, and
 `GLOBAL_TRADING_ENABLED` defaults to `false` with no path to `true`
 implemented.
 
+**Update:** once a Windows host with a live MT5 terminal and an FTMO demo
+account became available, the MT5-facing half of **Phase 5 (the MT5
+bridge)** was also built and verified live - see "Phase 5 / MT5 bridge
+(partial)" below. The WSS transport to a real backend is still untested,
+since no backend is deployed anywhere reachable from that host yet - the
+platform is still not connected to a broker end to end.
+
 ### Why this boundary specifically
 
 Phase 4 is the last phase whose acceptance criteria are self-contained:
@@ -329,19 +336,101 @@ verifiable by running tests locally.
   is purely Phase 5 territory, since there is no real agent handshake to
   skew the clock of.
 
+### Phase 5 / MT5 bridge (partial)
+
+Built and verified against a live Windows host running MetaTrader5, logged
+into an FTMO-Demo account - not synthetic, not simulated. Only the
+MT5-facing half; the WSS half is untested (see below).
+
+- **`agent/mt5_client.py`** implements `SimulatedBroker`'s exact method
+  surface (`place_order`, `modify_position`, `close_position`,
+  `get_positions`, `get_deals`) as a thin wrapper over the `MetaTrader5`
+  package, plus `get_symbol_spec`, `get_tick`, `terminal_health`, and
+  `account_snapshot`. Live-verified against a real broker, which surfaced
+  four quirks SPEC-04 doesn't mention: (1) `terminal_info().trade_allowed`
+  reflects the terminal's own "Algo Trading" toolbar toggle, not an account
+  permission - `_sync_place_order` checks it and rejects locally
+  (`LOCAL_NOT_CONNECTED`) rather than sending a doomed order; (2)
+  `order_send`'s synchronous result can report `retcode=DONE` with
+  `deal=0`/`price=0.0` on this broker's execution mode - the fill is real,
+  just not in the synchronous reply, so `_find_deal_by_order` retries
+  `history_deals_get(position=...)` up to 10 times (100ms apart) and never
+  invents a price; (3) `positions_get(ticket=...)` can briefly return empty
+  immediately after another order on the same ticket settles (the
+  terminal's local table is mid-update) - `_get_position` retries the same
+  way before concluding the position is genuinely gone; (4)
+  `history_deals_get`'s date-range arguments are naive datetimes in
+  broker-server time, not UTC - `_broker_offset` (computed from a live
+  tick, exactly what SPEC-04 §8.4 asks the agent to track for the
+  heartbeat) shifts both the query bounds and the returned `executed_at`
+  timestamps to true UTC. A related fifth issue: `history_deals_get` raises
+  `OSError` on Windows for dates near the 1970 epoch, so the default
+  lookback when `since` isn't given is 90 days, not "the beginning of
+  time."
+- **`agent/store.py`** (SQLite dedup store), **`agent/models.py`** (wire
+  dataclasses, not in SPEC-04 §8's file list but added so the agent doesn't
+  import `backend.app`), and **`agent/config.py`** (env-driven settings)
+  are fully implemented and unit-tested.
+- **`agent/transport.py`** has a real, unit-tested HMAC handshake, envelope
+  encode/decode, and backoff schedule, but its connect/reconnect loop has
+  never connected to an actual server - there is nothing to connect to yet.
+  **`agent/executor.py`**, **`agent/watcher.py`**, **`agent/heartbeat.py`**,
+  **`agent/health.py`** and **`agent/main.py`** are implemented and wired
+  together (verified by import and by inspection, and exercised indirectly
+  via `mt5_client`/`store`), but have no dedicated tests of their own yet -
+  a gap, not a claim they're fully verified. `main.py` defaults the
+  transport to disabled (`--enable-transport`), since pointing it anywhere
+  real isn't possible without a deployed backend.
+- **31 tests** (`agent/tests/`), all running against `tests/fake_mt5.py` (a
+  fake `MetaTrader5` module surface, not a real terminal) so they run
+  anywhere, including this repo's own Linux CI - `MetaTrader5` itself is
+  a Windows-only dependency (`sys_platform == 'win32'` in
+  `agent/pyproject.toml`) and is never imported on any other platform.
+  22 cover `mt5_client.py` (filling-mode resolution, every local pre-flight
+  rejection, fill mapping including the zero-price fallback lookup,
+  modify/close including volume clamping, the broker-time-offset
+  conversion for `get_deals` with a frozen clock), 9 cover `store.py`
+  (order-result dedup including first-write-wins, the outbound event
+  queue, deal-seen tracking, KV round-trip). Not covered by any test:
+  `transport.py`'s connect/reconnect loop, `executor.py`'s dispatch logic,
+  `watcher.py`'s poll loop, `heartbeat.py`'s payload assembly, `health.py`'s
+  HTTP handling, `main.py`'s wiring - none of these have run against a real
+  or mocked WebSocket server.
+- **Not implemented at all**: reconnection replay (SPEC-04 §7.2-§7.4-
+  replaying the local event queue from the last acked `event_id`, then a
+  full position snapshot plus a deal batch with 5-minute overlap on
+  reconnect; `store.py` has the primitives, nothing calls them yet); rate
+  limiting/backpressure on the heartbeat and the `event.quote` throttle
+  (SPEC-04 §5's 4/sec max); the agent's dedup replay on
+  `command.place_order` is unit-tested at the store layer but has never
+  been exercised through the full envelope-decode → executor → store path
+  with a real duplicate arriving over the wire.
+- **mypy/ruff**: the module originally hard-imported `MetaTrader5` at the
+  top level, which made it (and its 22-test file) uncollectable on any
+  non-Windows machine - the "31 tests green" the Windows session reported
+  had only ever run on that one machine. Fixed by making the import
+  optional (`try/except ImportError`) and replacing the three module-level
+  `mt5.*` constant lookups with hardcoded MQL5 constants (stable per the
+  API, mirrored in `fake_mt5.py`), so the suite now runs, and is gated, on
+  this repo's own Linux CI. A related `_run` helper had no return type
+  annotation, which was silently erasing every return type through
+  `MT5Client`'s async wrapper methods; made generic instead. `agent/`
+  now passes `ruff check`, `ruff format --check` and `mypy` clean, same bar
+  as `backend/`.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
 sensitivity) sub-stages; Phase 4's real transport, worker/queue
 infrastructure, and the two discrepancy kinds and retry logic listed above;
-and everything in Phases 5-8: the Windows `agent/` and the MQL5 `ea/`
-fallback, the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
-metrics, the nightly determinism replay job), the Next.js `frontend/`
-terminal (including any HTML/PDF rendering of the research report), and the
-demo/live measurement phases. `infra/` has a working dev
-`docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
-production compose file, since there's still nothing running in
-`workers/` yet to put behind it.
+Phase 5's WSS transport, reconnection replay, and rate limiting/backpressure
+(listed above); the MQL5 `ea/` fallback; the rest of Phase 6 (kill-switch
+triggers, alerting, Prometheus metrics, the nightly determinism replay
+job); the Next.js `frontend/` terminal (including any HTML/PDF rendering
+of the research report); and the demo/live measurement phases. `infra/`
+has a working dev `docker-compose.yml` and a stub `nginx/`/`prometheus/`
+layout but no production compose file, since there's still nothing running
+in `workers/` yet to put behind it.
 
 ## Consequences
 
@@ -360,14 +449,17 @@ production compose file, since there's still nothing running in
   it could produce today would be about synthetic bars, not XAUUSD. The
   next real increment for the research question is running it against
   actual historical data with a persistence layer, not more in-memory code.
-- The next real *build* increment is Phase 5 (the MT5 bridge), which
-  cannot be done in this environment at all - it needs a Windows host with
-  a MetaTrader5 terminal and a real demo account. Everything this MVP
-  built in `app/execution/` is designed so that Phase 5 only has to supply
-  a real implementation of the same broker command/event surface
-  `SimulatedBroker` already implements; the dispatcher, event consumer,
-  position manager and reconciler should not need to change.
+- The MT5-facing half of Phase 5 is now real and live-verified - `agent/`
+  can place, modify, close and read orders/positions/deals against an
+  actual FTMO-Demo account through the actual `MetaTrader5` package, not a
+  simulation. What's still missing is the other half: a deployed backend
+  for the agent's WSS transport to connect to, reconnection replay, and
+  test coverage for everything past `mt5_client.py`/`store.py` (see above).
+  `app/execution/`'s design held up - nothing in the dispatcher, event
+  consumer, position manager or reconciler needed to change to make this
+  possible.
 - Before any of this trades real money, the deferred indicator/MT5
   verification (`SPEC-05` §5), the full golden-fixture set, the full
-  `SPEC-07` §8 v1 experiment against real data, and Phase 5's real-agent
-  acceptance criteria must all be done for real, against an actual broker.
+  `SPEC-07` §8 v1 experiment against real data, and the rest of Phase 5's
+  acceptance criteria (a real backend connection, end to end) must all be
+  done for real, against an actual broker.

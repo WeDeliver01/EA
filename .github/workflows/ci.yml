@@ -110,3 +110,28 @@ jobs:
           else
             echo "::warning::app/execution has no implementation yet (MVP scope, see SPEC-10 Phase 4+) - skipping coverage gate"
           fi
+
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install agent
+        working-directory: agent
+        run: pip install -e ".[dev]"
+
+      - name: Ruff check
+        working-directory: agent
+        run: ruff check . && ruff format --check .
+
+      - name: mypy
+        working-directory: agent
+        run: mypy .
+
+      - name: pytest
+        working-directory: agent
+        run: pytest -q

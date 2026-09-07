@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+
 import pytest
 
 from agent.store import AgentStore
 
 
 @pytest.fixture
-async def store() -> AgentStore:
+async def store() -> AsyncGenerator[AgentStore, None]:
     s = AgentStore(":memory:")
     yield s
     await s.close()
@@ -27,7 +29,9 @@ class TestOrderDedup:
         `get_order_result` before calling this at all)."""
         await store.record_order_result("abc", {"retcode": 10009, "filled_volume": "0.02"})
         await store.record_order_result("abc", {"retcode": 99999})
-        assert (await store.get_order_result("abc"))["retcode"] == 10009
+        result = await store.get_order_result("abc")
+        assert result is not None
+        assert result["retcode"] == 10009
 
 
 class TestOutboundQueue:

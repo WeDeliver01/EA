@@ -7,6 +7,7 @@ told and reports facts; it does not decide whether a trade should happen.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
@@ -46,7 +47,9 @@ class CommandExecutor:
         self._store = store
 
     async def handle(self, envelope: Envelope) -> dict[str, Any]:
-        handler = getattr(self, f"_handle_{envelope.type.removeprefix('command.')}", None)
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = getattr(
+            self, f"_handle_{envelope.type.removeprefix('command.')}", None
+        )
         if handler is None:
             logger.warning("agent.executor.unknown_command", type=envelope.type)
             return {"error": "UNKNOWN_COMMAND", "type": envelope.type}
