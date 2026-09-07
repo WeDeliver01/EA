@@ -3,6 +3,7 @@ objects (SPEC-02 §6, P5)."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -95,3 +96,62 @@ class PositionRepository:
         )
         result = await self._session.execute(stmt)
         return tuple(position_row_to_domain(row, symbol=symbol) for row, symbol in result.all())
+
+    async def get_id_by_broker_position_id(
+        self, account_id: UUID, broker_position_id: str
+    ) -> UUID | None:
+        stmt = select(PositionRow.id).where(
+            PositionRow.account_id == account_id,
+            PositionRow.broker_position_id == broker_position_id,
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def set_initial_risk(
+        self,
+        position_id: UUID,
+        *,
+        stop_loss: Decimal,
+        take_profit: Decimal | None,
+        initial_risk: Decimal,
+        updated_at: datetime,
+    ) -> None:
+        """Called once, right after a position is created from a deal -
+        `deals` carries no stop/take-profit/risk data (P5's
+        projections-from-deals-alone design), so this is the only place
+        these fields are ever set from the original sizing decision."""
+        row = await self._session.get(PositionRow, position_id)
+        if row is None:
+            raise LookupError(f"position {position_id} not found")
+        row.stop_loss = stop_loss
+        row.take_profit = take_profit
+        row.initial_stop_loss = stop_loss
+        row.initial_risk = initial_risk
+        row.updated_at = updated_at
+        await self._session.flush()
+
+    async def apply_stop_update(
+        self, position_id: UUID, *, new_stop: Decimal, breakeven_moved: bool, updated_at: datetime
+    ) -> None:
+        """SPEC-06 §8 invariant: the stop only ever moves to reduce risk -
+        enforced by the caller (`position_manager.decide`'s `_improves`
+        check) before this is called, not re-checked here."""
+        row = await self._session.get(PositionRow, position_id)
+        if row is None:
+            raise LookupError(f"position {position_id} not found")
+        row.stop_loss = new_stop
+        if breakeven_moved:
+            row.breakeven_moved = True
+        row.updated_at = updated_at
+        await self._session.flush()
+
+    async def increment_partials_taken(self, position_id: UUID, *, updated_at: datetime) -> None:
+        """The rung index is persisted here, not inferred from remaining
+        volume (SPEC-06 §8: 'Step 4 must not fire twice for the same
+        rung')."""
+        row = await self._session.get(PositionRow, position_id)
+        if row is None:
+            raise LookupError(f"position {position_id} not found")
+        row.partials_taken += 1
+        row.updated_at = updated_at
+        await self._session.flush()

@@ -22,30 +22,31 @@ rather than rediscovering these decisions by reading diffs.
 ## Decision
 
 Build **Phase 0 (Foundation), Phase 1 (Domain and persistence), Phase 2
-(Strategy engine) and Phase 3 (Research engine)** to their stated acceptance
-criteria, against a real local PostgreSQL and Redis, using synthetic
-(hand-constructed, deterministic) bar data rather than a real broker feed.
-Stub the repository layout for Phases 4–8 (`agent/`, `ea/`, `frontend/`,
-`infra/nginx`, `infra/prometheus`, `docs/runbooks/`) so the shape described
-in `SPEC-00` §5 is in place, but do not implement their logic. This is a
-foundation to build the trading system on, not a trading system - nothing
-in this codebase is connected to a broker, and `GLOBAL_TRADING_ENABLED`
-defaults to `false` with no path to `true` implemented.
+(Strategy engine), Phase 3 (Research engine) and Phase 4 (Paper execution)**
+to their stated acceptance criteria, against a real local PostgreSQL and
+Redis, using synthetic (hand-constructed, deterministic) bar data and an
+in-process simulated broker rather than a real broker feed or a live MT5
+terminal. Stub the repository layout for Phases 5–8 (`agent/`, `ea/`,
+`frontend/`, `infra/nginx`, `infra/prometheus`, `docs/runbooks/`) so the
+shape described in `SPEC-00` §5 is in place, but do not implement their
+logic. This is a foundation to build the trading system on, not a trading
+system - nothing in this codebase is connected to a broker, and
+`GLOBAL_TRADING_ENABLED` defaults to `false` with no path to `true`
+implemented.
 
 ### Why this boundary specifically
 
-Phase 3 is the last phase whose acceptance criteria are self-contained: pure
-Python, a real database, no external service, no data that only a broker or
-weeks of demo trading can produce - the backtester consumes `Bar` objects
-regardless of where they came from, so synthetic bars exercise the same
-code paths real historical data would. Phase 4 (paper execution) needs the
-impure execution/outbox machinery running against a simulated broker over
-time; Phase 5 (MT5 bridge) needs a Windows host with MetaTrader5 installed;
-Phase 8 is explicitly a measurement phase, not a build phase. Stopping after
-Phase 3 is the last point where "done" is verifiable by running tests
-locally - and it is also the phase whose own §8 experiment (three strategy
-versions compared for a measurable edge) cannot honestly be run here at all,
-since running it for real needs real XAUUSD history, not synthetic bars.
+Phase 4 is the last phase whose acceptance criteria are self-contained:
+SPEC-10 itself specifies Phase 4 as running "against a simulated broker
+with no network" - it does not need a real broker any more than Phase 3's
+backtester needed real market data. Phase 5 (MT5 bridge) is a hard stop:
+its acceptance criteria explicitly require testing "against a demo
+account" on a live MetaTrader5 terminal, which needs a Windows host and a
+real broker login that don't exist in this environment and can't be
+substituted without lying about what was tested. Phase 8 is explicitly a
+measurement phase, not a build phase, needing weeks of real demo/live
+trading. Stopping after Phase 4 is the last point where "done" is
+verifiable by running tests locally.
 
 ## Deviations from the spec, and why
 
@@ -226,22 +227,131 @@ since running it for real needs real XAUUSD history, not synthetic bars.
   guard doesn't apply - but every run is seeded (`MonteCarloConfig.seed`)
   for reproducibility.
 
+### Phase 4 / paper execution
+
+- **`SimulatedBroker`** (`app/execution/broker.py`) stands in for the
+  Phase 5 agent, implementing the same command/event vocabulary SPEC-04 §4-5
+  defines (`place_order`, `modify_position`, `close_position`,
+  `get_positions`, `get_deals`, `OrderResult`) so `dispatcher.py`,
+  `event_consumer.py` and `position_manager.py` are the exact code that
+  would run against a real WSS-connected agent - only the transport
+  differs. It is also the "fake agent that can be instructed to misbehave"
+  SPEC-06 §10 asks for: every fault (`SILENT`, `REJECT`, `PARTIAL_FILL`) is
+  an explicit method a test calls, not a hidden branch.
+- **No real transport.** There is no WSS connection, no message envelope
+  signing, no reconnection/backoff logic (SPEC-04 §2, §7) - commands and
+  events are plain Python calls between in-process objects. Phase 5 is
+  where a real transport replaces this; nothing here needs to change
+  except which object implements the broker's few methods.
+- **No real worker/queue infrastructure.** SPEC-06 §5's `strategy_worker` /
+  `execution_worker` / `outbox_dispatcher` / `agent_event_consumer` are
+  described as separate async workers reading Redis streams
+  (`bars:closed`, `intents:pending`) with `XACK` semantics and Redis locks
+  (`LOCK:ANALYSE:*`, `LOCK:EXECUTE:*`). This MVP implements the same
+  sequence of steps as plain async functions (`submit_decision`,
+  `OutboxDispatcher.dispatch_pending`, `EventConsumer.process_order_result`)
+  called directly by tests or, eventually, a real worker loop. The
+  concurrency-safety property the locks exist for is still real and still
+  tested - `OutboxRepository.claim_pending`'s `FOR UPDATE SKIP LOCKED` is
+  what SPEC-06 §10's "two workers consume the same intent" actually
+  depends on, and it is proven against real Postgres
+  (`test_outbox.py::test_skip_locked_gives_two_concurrent_dispatchers_disjoint_rows`),
+  not simulated.
+- **Magic number** (SPEC-06 §7) is a `blake2b` hash of
+  `(strategy_version_id, instrument_id, environment)`, not the literal
+  `(strategy_version_seq << 20) | (instrument_seq << 8) | environment_code`
+  encoding - that needs a monotonic sequence-assignment table this MVP
+  doesn't build. The property the reconciler actually needs - the same
+  triple always producing the same magic, so an orphan can be attributed -
+  holds either way.
+- **Execution guard** (`OutboxDispatcher.execution_guard`, SPEC-06 §5 step
+  19) implements 4 of the 6 fast re-checks: `KILL_SWITCH_ACTIVE`,
+  `TRADING_DISABLED`, `DAILY_LOSS_LIMIT`, `RECONCILIATION_UNRESOLVED`. The
+  other two - `AGENT_DISCONNECTED` and `BROKER_DISCONNECTED` - need a live
+  agent heartbeat that doesn't exist without Phase 5.
+- **No day/week-start equity snapshot.** `DAILY_LOSS_LIMIT` and
+  `WEEKLY_LOSS_LIMIT` (both in the risk engine and the execution guard)
+  compare `realised_pnl_today`/`realised_pnl_week` against *current*
+  equity rather than equity snapshotted at the daily/weekly rollover
+  (SPEC-06 §3's stated correct behaviour) - no scheduler exists yet to take
+  that snapshot (that's Phase 6's reconciliation/scheduler worker).
+- **A fill - full or partial - skips `PARTIALLY_FILLED`.**
+  `EventConsumer` goes straight `SENT -> ACKNOWLEDGED -> FILLED ->
+  POSITION_OPEN` regardless of fill fraction. `SimulatedBroker.place_order`
+  resolves an order in exactly one response - there is no real broker
+  sending a second, later partial fill for the same order - so "partially
+  filled" here means the position opened smaller than requested, not that
+  more fills are still coming.
+- **Position management is price-driven, not bar- or tick-driven.**
+  `position_manager.decide()` takes a current price and ATR the caller
+  supplies (the same shape `research/backtester.py` uses per bar), because
+  there is no live quote stream. It never decides "the stop was hit" - a
+  live broker-side stop order executes itself; that fact would arrive as a
+  deal via reconciliation, the same path a manual close does. Not
+  implemented: structural invalidation (SPEC-06 §8 step 7, needs the
+  `StructureEngine` re-run against live context) and the emergency-spread
+  check (needs a live spread reading).
+- **Reconciliation** (`app/execution/reconciliation.py`, SPEC-06 §6)
+  classifies 7 of the 9 discrepancy kinds: `MISSING_AT_BROKER`,
+  `UNKNOWN_AT_BROKER`, `VOLUME_MISMATCH`, `SL_MISMATCH`, `TP_MISMATCH`,
+  `PRICE_MISMATCH`, `ORPHAN_INTENT`. `DUPLICATE_POSITION` and
+  `BALANCE_MISMATCH` are not classified - both need correlation data (a
+  setup-fingerprint history, a broker-reported balance feed) this MVP
+  doesn't carry. `ORPHAN_INTENT`'s resolution is a single search pass, not
+  SPEC-06 §6's "search, retry, expire after 3 attempts" - the retry count
+  needs a place to persist across reconciliation runs that doesn't exist
+  yet. The non-negotiable safety property holds exactly as specified: an
+  `UNKNOWN_AT_BROKER` position with no matching intent is recorded
+  `ORPHANED` and is never, under any code path, closed automatically.
+- **Two Phase 1 corrections Phase 4 needed**, both because Phase 4 was the
+  first caller to actually exercise these paths:
+  - `app/domain/execution/state_machine.py` gained `SENT -> CANCELLED` to
+    its allowed transitions. SPEC-06 §5 step 19 requires cancelling an
+    already-`SENT` intent when the execution guard blocks it just before
+    dispatch; the original Phase 1 transition table only allowed
+    `CANCELLED` from `QUEUED`.
+  - `DealRepository.list_for_account` (`app/repositories/deals.py`) now
+    eager-loads the `trade_intent` relationship it reads in
+    `deal_row_to_fill`. Every deal inserted before Phase 4 had
+    `trade_intent_id=None`, so the lazy load was never actually attempted;
+    the first deal with a real `trade_intent_id` triggered
+    `sqlalchemy.exc.MissingGreenlet`.
+  - The import-linter layering contract (`pyproject.toml`) moved
+    `app.repositories` into its own layer between `app.engines` and
+    `app.execution | app.research | app.workers`, which had incorrectly
+    modelled repositories as a *sibling* of execution rather than a layer
+    it depends on - a contract nobody had violated until Phase 4 needed to
+    persist state through it.
+- **SPEC-06 §10 chaos scenario coverage**: 11 of the 12 rows are covered by
+  named tests (`test_dispatcher.py`, `test_event_consumer.py`,
+  `test_reconciliation.py`, `test_outbox.py`, `test_chaos_scenarios.py`).
+  Row 11 (clock skew on the agent handshake) is not covered anywhere - it
+  is purely Phase 5 territory, since there is no real agent handshake to
+  skew the clock of.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
-sensitivity) sub-stages, and everything in Phases 4-8: the impure
-`execution/` order/outbox/reconciliation machinery, the Windows `agent/`
-and the MQL5 `ea/` fallback, the Next.js `frontend/` terminal (including
-any HTML/PDF rendering of the research report), and the demo/live
-measurement phases. `infra/` has a working dev `docker-compose.yml` and a
-stub `nginx/`/`prometheus/` layout but no production compose file, since
-there's nothing running in `execution/` or `workers/` yet to put behind it.
+sensitivity) sub-stages; Phase 4's real transport, worker/queue
+infrastructure, and the two discrepancy kinds and retry logic listed above;
+and everything in Phases 5-8: the Windows `agent/` and the MQL5 `ea/`
+fallback, the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
+metrics, the nightly determinism replay job), the Next.js `frontend/`
+terminal (including any HTML/PDF rendering of the research report), and the
+demo/live measurement phases. `infra/` has a working dev
+`docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
+production compose file, since there's still nothing running in
+`workers/` yet to put behind it.
 
 ## Consequences
 
-- The codebase is safe to run and explore, but cannot place a trade -
-  `execution/` is an empty package, and `GLOBAL_TRADING_ENABLED` has no
-  effect on anything.
+- The codebase can now run a full paper-trading lifecycle - signal to
+  intent to fill to management to close to trade record - against a
+  simulated broker and a real Postgres database, with the risk engine
+  wired live and every decision it makes reloaded from the database, not
+  trusted from a message. It still cannot place a trade with real money:
+  there is no connection to a broker anywhere in this repository, and
+  `GLOBAL_TRADING_ENABLED` has no effect on anything.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and
@@ -250,11 +360,14 @@ there's nothing running in `execution/` or `workers/` yet to put behind it.
   it could produce today would be about synthetic bars, not XAUUSD. The
   next real increment for the research question is running it against
   actual historical data with a persistence layer, not more in-memory code.
-- The next real *build* increment is Phase 4 (paper execution against a
-  simulated broker), since Phase 3's remaining gaps (parameter
-  perturbation, cost sensitivity, real market data) are data and
-  measurement problems, not missing code paths.
+- The next real *build* increment is Phase 5 (the MT5 bridge), which
+  cannot be done in this environment at all - it needs a Windows host with
+  a MetaTrader5 terminal and a real demo account. Everything this MVP
+  built in `app/execution/` is designed so that Phase 5 only has to supply
+  a real implementation of the same broker command/event surface
+  `SimulatedBroker` already implements; the dispatcher, event consumer,
+  position manager and reconciler should not need to change.
 - Before any of this trades real money, the deferred indicator/MT5
-  verification (`SPEC-05` §5), the full golden-fixture set, and the full
-  `SPEC-07` §8 v1 experiment against real data must be done for real,
-  against an actual broker export.
+  verification (`SPEC-05` §5), the full golden-fixture set, the full
+  `SPEC-07` §8 v1 experiment against real data, and Phase 5's real-agent
+  acceptance criteria must all be done for real, against an actual broker.

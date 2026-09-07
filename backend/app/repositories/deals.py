@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.domain.execution.enums import DealType, OrderSide
 from app.domain.execution.intent import Fill
@@ -65,11 +66,15 @@ class DealRepository:
         return row.id
 
     async def list_for_account(self, account_id: UUID) -> tuple[Fill, ...]:
+        # `deal_row_to_fill` reads `row.trade_intent` - eager-load it so that
+        # access never triggers a lazy load outside an awaited context
+        # (SQLAlchemy async raises MissingGreenlet if it does).
         stmt = (
             select(Deal, Instrument.canonical_symbol)
             .join(Instrument, Deal.instrument_id == Instrument.id)
             .where(Deal.account_id == account_id)
             .order_by(Deal.executed_at)
+            .options(selectinload(Deal.trade_intent))
         )
         result = await self._session.execute(stmt)
         return tuple(deal_row_to_fill(row, symbol=symbol) for row, symbol in result.all())

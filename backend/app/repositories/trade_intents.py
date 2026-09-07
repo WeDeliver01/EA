@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -18,6 +19,13 @@ from app.domain.execution.enums import ExecutionState
 from app.domain.execution.intent import OrderIntent
 from app.domain.execution.state_machine import assert_transition
 from app.models.tables import ExecutionTransition, TradeIntent
+
+
+@dataclass(frozen=True, slots=True)
+class IntentOrderDetails:
+    stop_loss: Decimal
+    take_profit: Decimal | None
+    risk_amount: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +144,19 @@ class TradeIntentRepository:
         if row is None:
             raise LookupError(f"trade_intent {trade_intent_id} not found")
         return ExecutionState(row.state)
+
+    async def get_order_details(self, trade_intent_id: UUID) -> IntentOrderDetails:
+        """Stop loss / take profit / risk amount as originally sized -
+        `deals` carries none of these (P5's projections-from-deals-alone
+        design means a position's risk parameters can't be reconstructed
+        by replaying deals), so a newly filled or reconciled position reads
+        them from here instead."""
+        row = await self._session.get(TradeIntent, trade_intent_id)
+        if row is None:
+            raise LookupError(f"trade_intent {trade_intent_id} not found")
+        return IntentOrderDetails(
+            stop_loss=row.stop_loss, take_profit=row.take_profit, risk_amount=row.risk_amount
+        )
 
     async def list_transitions(
         self, trade_intent_id: UUID

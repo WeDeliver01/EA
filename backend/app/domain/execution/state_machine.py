@@ -18,7 +18,12 @@ _ALLOWED: Mapping[ExecutionState, frozenset[ExecutionState]] = {
     _S.VALIDATING: frozenset({_S.APPROVED, _S.RISK_BLOCKED, _S.REJECTED}),
     _S.APPROVED: frozenset({_S.QUEUED, _S.RISK_BLOCKED, _S.EXPIRED}),
     _S.QUEUED: frozenset({_S.SENT, _S.CANCELLED, _S.EXPIRED}),
-    _S.SENT: frozenset({_S.ACKNOWLEDGED, _S.REJECTED, _S.BROKER_ERROR, _S.UNKNOWN}),
+    # CANCELLED is reachable from SENT (not just QUEUED): SPEC-06 §5 step 19,
+    # the execution guard re-checks the fast gates immediately before the
+    # broker call, after the intent is already marked SENT (step 16) - a
+    # gate tripping in that window cancels the order before it ever reaches
+    # the broker.
+    _S.SENT: frozenset({_S.ACKNOWLEDGED, _S.REJECTED, _S.BROKER_ERROR, _S.UNKNOWN, _S.CANCELLED}),
     _S.ACKNOWLEDGED: frozenset(
         {_S.PARTIALLY_FILLED, _S.FILLED, _S.CANCELLED, _S.EXPIRED, _S.BROKER_ERROR}
     ),
