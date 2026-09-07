@@ -16,7 +16,7 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import SimulatedBroker
+from app.execution.broker import AsyncSimulatedBrokerAdapter, SimulatedBroker
 from app.execution.dispatcher import OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import submit_decision
@@ -102,7 +102,7 @@ async def _open_position(
 
     broker = SimulatedBroker(spec=_SPEC)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -158,7 +158,7 @@ async def _open_position(
 
 def _manager(db_session: AsyncSession, broker: SimulatedBroker) -> PositionManager:
     return PositionManager(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         event_consumer=EventConsumer(
             agent_event_repo=AgentEventRepository(db_session),
             deal_repo=DealRepository(db_session),

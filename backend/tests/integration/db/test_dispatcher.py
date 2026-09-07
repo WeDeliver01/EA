@@ -14,7 +14,7 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import BrokerFault, SimulatedBroker
+from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, SimulatedBroker
 from app.execution.dispatcher import OutboxDispatcher
 from app.execution.intent_service import SubmitResult, submit_decision
 from app.models.tables import Account, PositionRow, Trade
@@ -111,7 +111,7 @@ async def test_dispatch_fills_and_marks_the_outbox_row_dispatched(
 
     broker = SimulatedBroker(spec=_SPEC)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -157,7 +157,7 @@ async def test_kill_switch_cancels_at_the_guard_without_calling_the_broker(
 
     broker = SimulatedBroker(spec=_SPEC)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -240,7 +240,7 @@ async def test_daily_loss_limit_hit_mid_dispatch_cancels_with_no_order_sent(
 
     broker = SimulatedBroker(spec=_SPEC)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -272,7 +272,7 @@ async def test_silent_fault_transitions_the_intent_to_unknown(db_session: AsyncS
     broker = SimulatedBroker(spec=_SPEC)
     broker.inject_fault(result.client_order_id, BrokerFault.SILENT)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),

@@ -16,7 +16,7 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import BrokerFault, SimulatedBroker
+from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, SimulatedBroker
 from app.execution.dispatcher import OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import submit_decision
@@ -89,7 +89,7 @@ def _trade_decision(*, as_of: datetime) -> Decision:
 def _reconciler(db_session: AsyncSession, broker: SimulatedBroker) -> Reconciler:
     return Reconciler(
         session=db_session,
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         reconciliation_repo=ReconciliationRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
         position_repo=PositionRepository(db_session),
@@ -132,7 +132,7 @@ async def _open_position_unknown_to_local(
     broker = SimulatedBroker(spec=_SPEC)
     broker.inject_fault(result.client_order_id, BrokerFault.SILENT)
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),

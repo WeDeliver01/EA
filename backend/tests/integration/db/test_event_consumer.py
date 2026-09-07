@@ -15,7 +15,7 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import BrokerFault, SimulatedBroker
+from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, SimulatedBroker
 from app.execution.dispatcher import DispatchOutcome, OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import SubmitResult, submit_decision
@@ -108,7 +108,7 @@ async def _submit_and_dispatch(
     await db_session.commit()
 
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -248,7 +248,7 @@ async def test_reject_transitions_the_intent_to_rejected(db_session: AsyncSessio
         result.client_order_id, BrokerFault.REJECT, retcode=10016, retcode_text="INVALID_STOPS"
     )
     dispatcher = OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),

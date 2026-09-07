@@ -50,6 +50,11 @@ src = ["app", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+# Raw SQL DDL statements (CREATE TABLE PARTITION OF, CREATE RULE) - line
+# length here is dictated by the SQL statement itself, not Python style.
+"migrations/versions/0001_initial_schema.py" = ["E501"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
 

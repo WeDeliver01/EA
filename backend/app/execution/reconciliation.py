@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.execution.enums import DealType, ExecutionState, OrderSide, PositionStatus
 from app.domain.market.enums import Direction
-from app.execution.broker import BrokerPositionSnapshot, SimulatedBroker
+from app.execution.broker import AsyncBroker, BrokerPositionSnapshot
 from app.execution.event_consumer import EventConsumer
 from app.models.tables import PositionRow
 from app.repositories.accounts import AccountRepository
@@ -228,7 +228,7 @@ class Reconciler:
         self,
         *,
         session: AsyncSession,
-        broker: SimulatedBroker,
+        broker: AsyncBroker,
         reconciliation_repo: ReconciliationRepository,
         intent_repo: TradeIntentRepository,
         position_repo: PositionRepository,
@@ -252,7 +252,7 @@ class Reconciler:
         pending_intents: list[PendingIntent],
         as_of: datetime,
     ) -> list[Finding]:
-        broker_positions = self._broker.get_positions()
+        broker_positions = await self._broker.get_positions()
         findings = classify(
             local_positions=local_positions,
             broker_positions=broker_positions,
@@ -334,10 +334,11 @@ class Reconciler:
         as_of: datetime,
     ) -> None:
         assert finding.broker_position_id is not None
+        deals = await self._broker.get_deals()
         matching_deal = next(
             (
                 d
-                for d in self._broker.get_deals()
+                for d in deals
                 if d.broker_position_id == finding.broker_position_id
                 and d.deal_type in (DealType.EXIT, DealType.PARTIAL_EXIT)
             ),
@@ -390,9 +391,10 @@ class Reconciler:
         )
 
         if finding.matched_intent_id is not None:
+            deals = await self._broker.get_deals()
             deal = next(
                 d
-                for d in self._broker.get_deals()
+                for d in deals
                 if d.broker_position_id == finding.broker_position_id
                 and d.deal_type == DealType.ENTRY
             )
@@ -482,7 +484,7 @@ class Reconciler:
 
         if broker_sl is None and local_sl is not None:
             assert finding.broker_position_id is not None
-            self._broker.modify_position(
+            await self._broker.modify_position(
                 finding.broker_position_id, stop_loss=Decimal(str(local_sl))
             )
             await self._reconciliation_repo.resolve(

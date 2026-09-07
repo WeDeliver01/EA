@@ -27,7 +27,7 @@ from uuid import UUID
 
 from app.domain.execution.enums import ExecutionState, OrderSide, OrderType
 from app.domain.execution.intent import OrderIntent
-from app.execution.broker import OrderResult, SimulatedBroker
+from app.execution.broker import AsyncBroker, OrderResult
 from app.repositories.accounts import AccountRepository
 from app.repositories.outbox import OutboxRepository, OutboxRow
 from app.repositories.reconciliation import ReconciliationRepository
@@ -76,7 +76,7 @@ class OutboxDispatcher:
     def __init__(
         self,
         *,
-        broker: SimulatedBroker,
+        broker: AsyncBroker,
         account_repo: AccountRepository,
         outbox_repo: OutboxRepository,
         intent_repo: TradeIntentRepository,
@@ -146,7 +146,7 @@ class OutboxDispatcher:
             )
 
         intent = _intent_from_payload(row.payload)
-        result = self._broker.place_order(intent, at=as_of)
+        result = await self._broker.place_order(intent, at=as_of)
         await self._outbox_repo.mark_dispatched(row.id, dispatched_at=as_of)
 
         if result is None:

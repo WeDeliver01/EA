@@ -1,14 +1,20 @@
 """SPEC-04: the execution agent protocol, stood in by an in-process fake.
 
-Phase 5 (not built - see docs/adr/0001-mvp-scope.md) is the real agent: a
-Windows process in `agent/` talking WSS to an actual MT5 terminal.
 `SimulatedBroker` implements the same command/event surface (SPEC-04 §4-5)
-so everything in `app/execution/` is the exact code that would run against
-the real agent - only the transport differs when Phase 5 eventually swaps
-this object for a WSS client. It is also the "fake agent that can be
-instructed to misbehave" SPEC-06 §10 requires for chaos testing: every
-fault it can inject is an explicit method, not a hidden branch, so a test
-states its scenario in one line.
+so everything in `app/execution/` is the exact code that runs against the
+real agent too - only the transport differs. `app/transport/ws_broker.py`
+(Phase 5) implements `AsyncBroker` for real, over a live WSS connection to
+`agent/`; `AsyncSimulatedBrokerAdapter` below implements it for this fake,
+so `dispatcher.py`/`position_manager.py`/`reconciliation.py` await the same
+interface either way and never know which broker they're actually talking
+to. `SimulatedBroker` itself stays synchronous (it does no real I/O, and
+every existing unit test calls it directly and synchronously) - the
+adapter is the only new thing.
+
+`SimulatedBroker` is also the "fake agent that can be instructed to
+misbehave" SPEC-06 §10 requires for chaos testing: every fault it can
+inject is an explicit method, not a hidden branch, so a test states its
+scenario in one line.
 
 Single instrument per broker instance, matching "for v1, single instrument"
 (SPEC-06 §4) - a second symbol needs a `SymbolSpec` per instrument, not per
@@ -21,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from app.domain.execution.enums import DealType, OrderSide
 from app.domain.execution.intent import Fill, OrderIntent
@@ -317,3 +323,75 @@ class SimulatedBroker:
         )
         self._deals.append(deal)
         return deal
+
+
+class AsyncBroker(Protocol):
+    """SPEC-04 §4-5's command surface, as `dispatcher.py`/
+    `position_manager.py`/`reconciliation.py` actually call it. Two
+    implementations: `AsyncSimulatedBrokerAdapter` (below, wraps
+    `SimulatedBroker`) and `app.transport.ws_broker.WSAgentBroker` (a real
+    WSS-connected agent). Callers never know which one they have."""
+
+    async def place_order(self, intent: OrderIntent, *, at: datetime) -> OrderResult | None: ...
+
+    async def modify_position(
+        self,
+        broker_position_id: str,
+        *,
+        stop_loss: Decimal | None = None,
+        take_profit: Decimal | None = None,
+    ) -> ModifyResult: ...
+
+    async def close_position(
+        self,
+        broker_position_id: str,
+        *,
+        price: Decimal,
+        at: datetime,
+        volume: Decimal | None = None,
+    ) -> Fill | None: ...
+
+    async def get_positions(self) -> tuple[BrokerPositionSnapshot, ...]: ...
+
+    async def get_deals(self, *, since: datetime | None = None) -> tuple[Fill, ...]: ...
+
+
+class AsyncSimulatedBrokerAdapter:
+    """Wraps a synchronous `SimulatedBroker` to satisfy `AsyncBroker`.
+    `SimulatedBroker` itself stays synchronous - it does no real I/O, and
+    every existing unit test constructs and calls it directly - only
+    orchestration code that needs to work against either broker goes
+    through this adapter."""
+
+    def __init__(self, broker: SimulatedBroker) -> None:
+        self._broker = broker
+
+    async def place_order(self, intent: OrderIntent, *, at: datetime) -> OrderResult | None:
+        return self._broker.place_order(intent, at=at)
+
+    async def modify_position(
+        self,
+        broker_position_id: str,
+        *,
+        stop_loss: Decimal | None = None,
+        take_profit: Decimal | None = None,
+    ) -> ModifyResult:
+        return self._broker.modify_position(
+            broker_position_id, stop_loss=stop_loss, take_profit=take_profit
+        )
+
+    async def close_position(
+        self,
+        broker_position_id: str,
+        *,
+        price: Decimal,
+        at: datetime,
+        volume: Decimal | None = None,
+    ) -> Fill | None:
+        return self._broker.close_position(broker_position_id, price=price, at=at, volume=volume)
+
+    async def get_positions(self) -> tuple[BrokerPositionSnapshot, ...]:
+        return self._broker.get_positions()
+
+    async def get_deals(self, *, since: datetime | None = None) -> tuple[Fill, ...]:
+        return self._broker.get_deals(since=since)

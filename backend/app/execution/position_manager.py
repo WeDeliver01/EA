@@ -40,7 +40,7 @@ from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import TakeProfit
 from app.engines.config import TradeConstructionConfig
 from app.engines.risk.sizing import floor_to_step
-from app.execution.broker import RETCODE_DONE, ModifyResult, SimulatedBroker
+from app.execution.broker import RETCODE_DONE, AsyncBroker, ModifyResult
 from app.execution.event_consumer import EventConsumer
 from app.repositories.accounts import AccountRepository
 from app.repositories.positions import PositionRepository
@@ -145,7 +145,7 @@ class PositionManager:
     def __init__(
         self,
         *,
-        broker: SimulatedBroker,
+        broker: AsyncBroker,
         event_consumer: EventConsumer,
         position_repo: PositionRepository,
         account_repo: AccountRepository,
@@ -163,7 +163,7 @@ class PositionManager:
 
         if action.kind == "modify_stop":
             assert action.new_stop is not None
-            result: ModifyResult = self._broker.modify_position(
+            result: ModifyResult = await self._broker.modify_position(
                 position.broker_position_id, stop_loss=action.new_stop
             )
             if result.retcode != RETCODE_DONE:
@@ -178,7 +178,7 @@ class PositionManager:
 
         assert action.close_volume is not None
         assert action.close_price is not None
-        close_fill = self._broker.close_position(
+        close_fill = await self._broker.close_position(
             position.broker_position_id,
             price=action.close_price,
             at=at,

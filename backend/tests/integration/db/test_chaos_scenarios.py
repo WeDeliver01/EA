@@ -30,7 +30,7 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import BrokerFault, SimulatedBroker
+from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, SimulatedBroker
 from app.execution.dispatcher import OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import SubmitResult, submit_decision
@@ -103,7 +103,7 @@ def _trade_decision(*, as_of: datetime) -> Decision:
 
 def _dispatcher(db_session: AsyncSession, broker: SimulatedBroker) -> OutboxDispatcher:
     return OutboxDispatcher(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         account_repo=AccountRepository(db_session),
         outbox_repo=OutboxRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
@@ -234,7 +234,7 @@ async def test_unresolved_critical_discrepancy_blocks_new_entries(
     )
     reconciler = Reconciler(
         session=db_session,
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         reconciliation_repo=ReconciliationRepository(db_session),
         intent_repo=TradeIntentRepository(db_session),
         position_repo=PositionRepository(db_session),
@@ -352,7 +352,7 @@ async def test_full_lifecycle_signal_to_intent_to_fill_to_management_to_close_to
     assert action.kind == "modify_stop"
 
     manager = PositionManager(
-        broker=broker,
+        broker=AsyncSimulatedBrokerAdapter(broker),
         event_consumer=consumer,
         position_repo=PositionRepository(db_session),
         account_repo=AccountRepository(db_session),

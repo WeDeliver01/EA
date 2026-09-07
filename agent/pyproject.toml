@@ -23,6 +23,12 @@ dev = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["agent"]
+
+[tool.setuptools.package-dir]
+agent = "."
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
