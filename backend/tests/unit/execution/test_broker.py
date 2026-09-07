@@ -174,6 +174,12 @@ def test_modify_position_updates_stop_and_take_profit() -> None:
     assert broker.get_positions()[0].stop_loss == Decimal("3395")
 
 
+def test_close_position_on_unknown_position_returns_none() -> None:
+    broker = SimulatedBroker(spec=_SPEC)
+    result = broker.close_position("does-not-exist", price=Decimal("3400"), at=_AT)
+    assert result is None
+
+
 def test_modify_position_on_unknown_position_returns_no_position_retcode() -> None:
     broker = SimulatedBroker(spec=_SPEC)
     result = broker.modify_position("does-not-exist", stop_loss=Decimal("3395"))

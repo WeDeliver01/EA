@@ -20,7 +20,7 @@ from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, Simul
 from app.execution.dispatcher import OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import submit_decision
-from app.execution.reconciliation import PendingIntent, Reconciler
+from app.execution.reconciliation import Finding, PendingIntent, Reconciler
 from app.models.tables import Account, PositionRow
 from app.repositories.accounts import AccountRepository
 from app.repositories.agent_events import AgentEventRepository
@@ -359,3 +359,256 @@ async def test_sl_mismatch_adopts_the_brokers_tighter_stop(db_session: AsyncSess
     updated_row = await db_session.get(PositionRow, position_row.id)
     assert updated_row is not None
     assert updated_row.stop_loss == Decimal("3395")
+
+
+async def _attach_locally(
+    db_session: AsyncSession,
+    refs: SeededRefs,
+    *,
+    broker: SimulatedBroker,
+    trade_intent_id: uuid.UUID,
+    broker_position_id: str,
+) -> PositionRow:
+    """Runs one reconciliation pass to turn the broker-only position from
+    `_open_position_unknown_to_local` into a real local `PositionRow`, for
+    tests that need a genuine local position to attach a hand-built
+    `Finding` to."""
+    magic = broker.get_positions()[0].magic
+    pending_intent = PendingIntent(
+        id=trade_intent_id,
+        client_order_id="",
+        magic=magic,
+        symbol="XAUUSD",
+        side=OrderSide.BUY,
+        volume=Decimal("0.10"),
+        created_at=datetime.now(UTC),
+        state=ExecutionState.UNKNOWN,
+    )
+    reconciler = _reconciler(db_session, broker)
+    await reconciler.run(
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        local_positions=[],
+        pending_intents=[pending_intent],
+        as_of=datetime.now(UTC),
+    )
+    await db_session.commit()
+    row = (
+        await db_session.execute(
+            select(PositionRow).where(PositionRow.broker_position_id == broker_position_id)
+        )
+    ).scalar_one()
+    return row
+
+
+async def test_unhandled_discrepancy_kinds_are_recorded_but_never_auto_resolved(
+    db_session: AsyncSession,
+) -> None:
+    """VOLUME_MISMATCH, TP_MISMATCH and PRICE_MISMATCH have no dedicated
+    resolver (see the ADR) - `_apply_resolution`'s fallthrough must still
+    record them, just without touching anything."""
+    refs = await seed_minimal_refs(db_session)
+    reconciler = _reconciler(db_session, SimulatedBroker(spec=_SPEC))
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="VOLUME_MISMATCH",
+        severity="warning",
+        local_state={"volume": "0.10"},
+        broker_state={"volume": "0.20"},
+    )
+    await reconciler._apply_resolution(
+        finding,
+        run_id=run_id,
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        as_of=datetime.now(UTC),
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert any(d.kind == "VOLUME_MISMATCH" for d in unresolved)
+
+
+async def test_missing_at_broker_with_no_matching_deal_stays_unresolved(
+    db_session: AsyncSession,
+) -> None:
+    """No deal evidence yet of how the position closed - stays unresolved
+    rather than guessing."""
+    refs = await seed_minimal_refs(db_session)
+    reconciler = _reconciler(db_session, SimulatedBroker(spec=_SPEC))
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="MISSING_AT_BROKER",
+        severity="critical",
+        local_state={"volume": "0.10"},
+        broker_state=None,
+        broker_position_id="no-such-position",
+    )
+    await reconciler._resolve_missing_at_broker(
+        finding,
+        run_id=run_id,
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        as_of=datetime.now(UTC),
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert any(d.kind == "MISSING_AT_BROKER" for d in unresolved)
+
+
+async def test_missing_at_broker_with_zero_profit_deal_skips_pnl_update(
+    db_session: AsyncSession,
+) -> None:
+    """A flat close (exit price == entry price) is zero-profit and legitimate
+    - the account balance must not move for a no-op P&L."""
+    refs = await seed_minimal_refs(db_session)
+    broker, trade_intent_id, broker_position_id = await _open_position_unknown_to_local(
+        db_session, refs
+    )
+    await _attach_locally(
+        db_session,
+        refs,
+        broker=broker,
+        trade_intent_id=trade_intent_id,
+        broker_position_id=broker_position_id,
+    )
+    account_before = await AccountRepository(db_session).load_account_state(
+        refs.account_id, as_of=datetime.now(UTC)
+    )
+
+    # Flat manual close: same price as entry (3400.00), so profit is 0.
+    broker.simulate_manual_close(broker_position_id, price=Decimal("3400.00"), at=datetime.now(UTC))
+
+    reconciler = _reconciler(db_session, broker)
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="MISSING_AT_BROKER",
+        severity="critical",
+        local_state={"volume": "0.10"},
+        broker_state=None,
+        broker_position_id=broker_position_id,
+    )
+    await reconciler._resolve_missing_at_broker(
+        finding,
+        run_id=run_id,
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        as_of=datetime.now(UTC),
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert not any(d.kind == "MISSING_AT_BROKER" for d in unresolved)  # resolved
+    account_after = await AccountRepository(db_session).load_account_state(
+        refs.account_id, as_of=datetime.now(UTC)
+    )
+    assert account_after.balance == account_before.balance
+
+
+async def test_sl_mismatch_sets_the_brokers_missing_stop(db_session: AsyncSession) -> None:
+    refs = await seed_minimal_refs(db_session)
+    broker, trade_intent_id, broker_position_id = await _open_position_unknown_to_local(
+        db_session, refs
+    )
+    local_row = await _attach_locally(
+        db_session,
+        refs,
+        broker=broker,
+        trade_intent_id=trade_intent_id,
+        broker_position_id=broker_position_id,
+    )
+
+    reconciler = _reconciler(db_session, broker)
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="SL_MISMATCH",
+        severity="warning",
+        local_state={"stop_loss": "3390.00"},
+        broker_state={"stop_loss": None},
+        local_position_id=local_row.id,
+        broker_position_id=broker_position_id,
+    )
+    await reconciler._resolve_sl_mismatch(
+        finding, run_id=run_id, account_id=refs.account_id, as_of=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert not any(d.kind == "SL_MISMATCH" for d in unresolved)  # resolved
+    assert broker.get_positions()[0].stop_loss == Decimal("3390.00")
+
+
+async def test_sl_mismatch_with_no_local_stop_stays_unresolved(db_session: AsyncSession) -> None:
+    """Neither branch handles "local has no stop at all" - documented gap,
+    pinned here rather than left silently uncovered."""
+    refs = await seed_minimal_refs(db_session)
+    broker, trade_intent_id, broker_position_id = await _open_position_unknown_to_local(
+        db_session, refs
+    )
+    local_row = await _attach_locally(
+        db_session,
+        refs,
+        broker=broker,
+        trade_intent_id=trade_intent_id,
+        broker_position_id=broker_position_id,
+    )
+
+    reconciler = _reconciler(db_session, broker)
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="SL_MISMATCH",
+        severity="warning",
+        local_state={"stop_loss": None},
+        broker_state={"stop_loss": "3395.00"},
+        local_position_id=local_row.id,
+        broker_position_id=broker_position_id,
+    )
+    await reconciler._resolve_sl_mismatch(
+        finding, run_id=run_id, account_id=refs.account_id, as_of=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert any(d.kind == "SL_MISMATCH" for d in unresolved)
+
+
+async def test_sl_mismatch_adopts_broker_stop_even_if_the_local_row_is_gone(
+    db_session: AsyncSession,
+) -> None:
+    """The discrepancy still resolves (the broker's value is authoritative
+    either way) even if the local position row can't be found to update."""
+    refs = await seed_minimal_refs(db_session)
+    broker, trade_intent_id, broker_position_id = await _open_position_unknown_to_local(
+        db_session, refs
+    )
+
+    reconciler = _reconciler(db_session, broker)
+    run_id = await ReconciliationRepository(db_session).start_run(
+        refs.account_id, started_at=datetime.now(UTC)
+    )
+    finding = Finding(
+        kind="SL_MISMATCH",
+        severity="warning",
+        local_state={"stop_loss": "3390.00"},
+        broker_state={"stop_loss": "3395.00"},
+        local_position_id=uuid.uuid4(),  # no such row
+        broker_position_id=broker_position_id,
+    )
+    await reconciler._resolve_sl_mismatch(
+        finding, run_id=run_id, account_id=refs.account_id, as_of=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    unresolved = await ReconciliationRepository(db_session).list_unresolved(refs.account_id)
+    assert not any(d.kind == "SL_MISMATCH" for d in unresolved)  # resolved

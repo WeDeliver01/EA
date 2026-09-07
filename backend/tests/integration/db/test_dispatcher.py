@@ -178,6 +178,77 @@ async def test_kill_switch_cancels_at_the_guard_without_calling_the_broker(
     )
 
 
+async def test_trading_disabled_cancels_at_the_guard_without_calling_the_broker(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await _enable_trading(db_session, refs.account_id)
+    await db_session.commit()
+    result = await _submit(db_session, refs, reference="SIG-DISP-TRADING-DISABLED")
+
+    # Trading gets disabled after submission but before dispatch - the
+    # same race the kill-switch test above exercises, for the other flag.
+    account = await db_session.get(Account, refs.account_id)
+    assert account is not None
+    account.trading_enabled = False
+    await db_session.commit()
+
+    broker = SimulatedBroker(spec=_SPEC)
+    dispatcher = OutboxDispatcher(
+        broker=AsyncSimulatedBrokerAdapter(broker),
+        account_repo=AccountRepository(db_session),
+        outbox_repo=OutboxRepository(db_session),
+        intent_repo=TradeIntentRepository(db_session),
+        reconciliation_repo=ReconciliationRepository(db_session),
+    )
+    outcomes = await dispatcher.dispatch_pending(
+        account_id=refs.account_id, as_of=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].sent is False
+    assert outcomes[0].cancelled_reason == "TRADING_DISABLED"
+    assert broker.get_positions() == ()
+    assert (
+        await TradeIntentRepository(db_session).get_state(result.trade_intent_id)
+        == ExecutionState.CANCELLED
+    )
+
+
+async def test_dispatch_pending_skips_non_place_order_rows(db_session: AsyncSession) -> None:
+    """`modify_position`/`close_position` dispatch belongs to
+    `position_manager`, not this loop - a row of either type must be left
+    alone (never marked dispatched, never counted in the outcomes)."""
+    refs = await seed_minimal_refs(db_session)
+    await _enable_trading(db_session, refs.account_id)
+    outbox_repo = OutboxRepository(db_session)
+    now = datetime.now(UTC)
+    await outbox_repo.enqueue(
+        aggregate_type="position",
+        aggregate_id=uuid.uuid4(),
+        command_type="modify_position",
+        idempotency_key="mod-1",
+        payload={},
+        available_at=now,
+        created_at=now,
+    )
+    await db_session.commit()
+
+    dispatcher = OutboxDispatcher(
+        broker=AsyncSimulatedBrokerAdapter(SimulatedBroker(spec=_SPEC)),
+        account_repo=AccountRepository(db_session),
+        outbox_repo=outbox_repo,
+        intent_repo=TradeIntentRepository(db_session),
+        reconciliation_repo=ReconciliationRepository(db_session),
+    )
+    outcomes = await dispatcher.dispatch_pending(account_id=refs.account_id, as_of=now)
+
+    assert outcomes == []
+    # Still pending: dispatch_pending never touched it.
+    assert len(await outbox_repo.claim_pending()) == 1
+
+
 async def test_daily_loss_limit_hit_mid_dispatch_cancels_with_no_order_sent(
     db_session: AsyncSession,
 ) -> None:

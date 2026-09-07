@@ -325,7 +325,7 @@ class SimulatedBroker:
         return deal
 
 
-class AsyncBroker(Protocol):
+class AsyncBroker(Protocol):  # pragma: no cover - interface only, never executed
     """SPEC-04 §4-5's command surface, as `dispatcher.py`/
     `position_manager.py`/`reconciliation.py` actually call it. Two
     implementations: `AsyncSimulatedBrokerAdapter` (below, wraps

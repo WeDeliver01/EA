@@ -4,6 +4,7 @@ none - and the risk evaluation always uses live, DB-reloaded state."""
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -137,6 +138,32 @@ async def test_trading_disabled_produces_a_risk_blocked_intent_and_no_outbox_row
     assert result.outbox_id is None
     assert await intent_repo.get_state(result.trade_intent_id) == ExecutionState.RISK_BLOCKED
     assert await outbox_repo.claim_pending() == ()
+
+
+async def test_wait_decision_is_rejected(db_session: AsyncSession) -> None:
+    refs = await seed_minimal_refs(db_session)
+    signal_id = await seed_signal(db_session, refs, reference="SIG-INTENT-WAIT")
+    await _enable_trading(db_session, refs.account_id)
+    await db_session.commit()
+
+    now = datetime.now(UTC)
+    wait_decision = dataclasses.replace(
+        _trade_decision(symbol="XAUUSD", as_of=now), outcome=DecisionOutcome.WAIT
+    )
+
+    with pytest.raises(ValueError, match="requires a TRADE decision"):
+        await submit_decision(
+            wait_decision,
+            account_repo=AccountRepository(db_session),
+            outbox_repo=OutboxRepository(db_session),
+            intent_repo=TradeIntentRepository(db_session),
+            signal_id=signal_id,
+            account_id=refs.account_id,
+            instrument_id=refs.instrument_id,
+            strategy_version_id=refs.strategy_version_id,
+            environment="demo",
+            as_of=now,
+        )
 
 
 async def test_magic_is_stable_across_calls_for_the_same_triple(db_session: AsyncSession) -> None:

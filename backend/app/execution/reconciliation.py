@@ -404,10 +404,13 @@ class Reconciler:
                 instrument_id=instrument_id,
                 trade_intent_id=finding.matched_intent_id,
             )
+            # record_deal (just above) always creates a position for this
+            # exact broker_position_id first, so this is never None in
+            # practice - defensive, excluded from branch coverage.
             position_id = await self._position_repo.get_id_by_broker_position_id(
                 account_id, finding.broker_position_id
             )
-            if position_id is not None:
+            if position_id is not None:  # pragma: no branch
                 details = await self._intent_repo.get_order_details(finding.matched_intent_id)
                 await self._position_repo.set_initial_risk(
                     position_id,

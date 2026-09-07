@@ -124,6 +124,25 @@ def test_breakeven_does_not_fire_below_the_target_r() -> None:
     assert action.kind == "none"
 
 
+def test_breakeven_does_not_move_a_stop_that_is_already_better() -> None:
+    """Target R is reached, but the current stop (e.g. left over from an
+    earlier trail) is already tighter than the breakeven candidate would
+    be - moving it would widen the stop, so nothing happens."""
+    position = _position(current_stop="3405")  # already better than the 3402 candidate below
+    action = decide(
+        position,
+        current_price=Decimal("3410"),
+        atr=Decimal("4"),
+        cfg=_cfg(
+            breakeven_at_r=Decimal("1.0"), breakeven_buffer_atr=Decimal("0.5"), trail_mode="none"
+        ),
+        spec=_SPEC,
+        as_of=_START + timedelta(minutes=15),
+        max_holding_duration=timedelta(hours=24),
+    )
+    assert action.kind == "none"
+
+
 def test_take_profit_rung_fires_in_order_and_reports_the_correct_close_price() -> None:
     tps = (
         TakeProfit(level=Decimal("3410"), fraction=Decimal("0.5"), r_multiple=Decimal("1.0")),

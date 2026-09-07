@@ -242,3 +242,91 @@ async def test_close_partial_leaves_the_position_open_with_reduced_volume(
     assert row.status == "OPEN"
     assert row.volume == position.remaining_volume - half
     assert row.partials_taken == 1
+
+
+async def test_apply_none_action_touches_nothing(db_session: AsyncSession) -> None:
+    refs = await seed_minimal_refs(db_session)
+    broker, position = await _open_position(db_session, refs)
+
+    manager = _manager(db_session, broker)
+    await manager.apply(position, ManagementAction(kind="none"), spec=_SPEC, at=datetime.now(UTC))
+    await db_session.commit()
+
+    row = await db_session.get(PositionRow, position.id)
+    assert row is not None
+    assert row.status == "OPEN"
+    assert row.stop_loss == position.current_stop
+    assert len(broker.get_positions()) == 1
+
+
+async def test_modify_stop_is_a_no_op_when_the_broker_has_no_such_position(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    broker, position = await _open_position(db_session, refs)
+    broker.close_position(position.broker_position_id, price=Decimal("3400"), at=datetime.now(UTC))
+
+    manager = _manager(db_session, broker)
+    action = ManagementAction(kind="modify_stop", new_stop=Decimal("3402"), sets_breakeven=True)
+    await manager.apply(position, action, spec=_SPEC, at=datetime.now(UTC))
+    await db_session.commit()
+
+    row = await db_session.get(PositionRow, position.id)
+    assert row is not None
+    assert row.stop_loss == position.current_stop  # untouched: the broker call was refused
+
+
+async def test_close_is_a_no_op_when_the_broker_has_no_such_position(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    broker, position = await _open_position(db_session, refs)
+    broker.close_position(position.broker_position_id, price=Decimal("3400"), at=datetime.now(UTC))
+
+    manager = _manager(db_session, broker)
+    action = ManagementAction(
+        kind="close_full",
+        close_volume=position.remaining_volume,
+        close_price=Decimal("3420.00"),
+        close_reason="TIME_EXIT",
+    )
+    await manager.apply(position, action, spec=_SPEC, at=datetime.now(UTC))
+    await db_session.commit()
+
+    row = await db_session.get(PositionRow, position.id)
+    assert row is not None
+    # apply() returned early on close_fill=None; the local row is untouched
+    # regardless of the broker-level close above - reconciliation's job.
+    assert row.status == "OPEN"
+
+
+async def test_close_at_entry_price_skips_the_realised_pnl_update(
+    db_session: AsyncSession,
+) -> None:
+    """Zero profit is a legitimate close (e.g. a flat time-exit) - the
+    account's balance must not be touched for a no-op P&L."""
+    refs = await seed_minimal_refs(db_session)
+    broker, position = await _open_position(db_session, refs)
+
+    account_before = await AccountRepository(db_session).load_account_state(
+        refs.account_id, as_of=datetime.now(UTC)
+    )
+
+    manager = _manager(db_session, broker)
+    action = ManagementAction(
+        kind="close_full",
+        close_volume=position.remaining_volume,
+        close_price=position.entry_price,
+        close_reason="TIME_EXIT",
+    )
+    await manager.apply(position, action, spec=_SPEC, at=datetime.now(UTC))
+    await db_session.commit()
+
+    row = await db_session.get(PositionRow, position.id)
+    assert row is not None
+    assert row.status == "CLOSED"
+
+    account_after = await AccountRepository(db_session).load_account_state(
+        refs.account_id, as_of=datetime.now(UTC)
+    )
+    assert account_after.balance == account_before.balance

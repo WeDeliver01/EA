@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import time
@@ -11,6 +12,7 @@ from typing import Any
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.config import Settings
 
@@ -86,3 +88,31 @@ def verify_agent_signature(
         return False
     expected = sign_agent_frame(secret=secret, api_key=api_key, ts_millis=ts_millis, nonce=nonce)
     return hmac.compare_digest(expected, signature)
+
+
+def hash_api_key(api_key: str) -> str:
+    """SHA-256, not Argon2id: an agent's `api_key` is a high-entropy
+    generated secret, not a human password, so a fast deterministic hash
+    that supports direct lookup-by-hash is correct here - Argon2id's
+    per-hash salt would make that lookup impossible without checking every
+    row."""
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _fernet(encryption_key: str) -> Fernet:
+    # `agent_secret_encryption_key` is an operator-chosen string (env var),
+    # not necessarily a valid Fernet key (32 url-safe base64 bytes) -
+    # derive one deterministically so any non-empty string works.
+    derived = base64.urlsafe_b64encode(hashlib.sha256(encryption_key.encode()).digest())
+    return Fernet(derived)
+
+
+def encrypt_secret(secret: bytes, *, encryption_key: str) -> bytes:
+    return _fernet(encryption_key).encrypt(secret)
+
+
+def decrypt_secret(token: bytes, *, encryption_key: str) -> bytes:
+    try:
+        return _fernet(encryption_key).decrypt(token)
+    except InvalidToken as exc:
+        raise ValueError("hmac_secret_enc could not be decrypted - wrong encryption key?") from exc

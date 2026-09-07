@@ -15,11 +15,17 @@ from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.enums import DecisionOutcome
-from app.execution.broker import AsyncSimulatedBrokerAdapter, BrokerFault, SimulatedBroker
+from app.execution.broker import (
+    RETCODE_DONE,
+    AsyncSimulatedBrokerAdapter,
+    BrokerFault,
+    OrderResult,
+    SimulatedBroker,
+)
 from app.execution.dispatcher import DispatchOutcome, OutboxDispatcher
 from app.execution.event_consumer import EventConsumer
 from app.execution.intent_service import SubmitResult, submit_decision
-from app.models.tables import Account, PositionRow
+from app.models.tables import Account, AgentEvent, PositionRow
 from app.repositories.accounts import AccountRepository
 from app.repositories.agent_events import AgentEventRepository, simulated_agent_id
 from app.repositories.deals import DealRepository
@@ -276,3 +282,73 @@ async def test_reject_transitions_the_intent_to_rejected(db_session: AsyncSessio
         await TradeIntentRepository(db_session).get_state(result.trade_intent_id)
         == ExecutionState.REJECTED
     )
+
+
+async def test_malformed_done_result_records_the_error_and_reraises(
+    db_session: AsyncSession,
+) -> None:
+    """A `DONE` result with no `broker_deal_id` violates `_apply`'s own
+    invariant (SPEC-04 §4 step 7: a done order always carries a deal
+    ticket) - this is the agent sending something the protocol says can't
+    happen. The failure must still be durably recorded, not swallowed."""
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    malformed = OrderResult(
+        client_order_id="CO-MALFORMED",
+        retcode=RETCODE_DONE,
+        retcode_text="DONE",
+        broker_order_id="1",
+        broker_deal_id=None,
+        broker_position_id="1",
+        filled_volume=Decimal("0.01"),
+        fill_price=Decimal("100"),
+        requested_price=Decimal("100"),
+        slippage_points=0,
+        latency_ms=1,
+    )
+
+    consumer = _consumer(db_session)
+    with pytest.raises(AssertionError):
+        await consumer.process_order_result(
+            malformed,
+            trade_intent_id=uuid.uuid4(),
+            account_id=refs.account_id,
+            instrument_id=refs.instrument_id,
+            symbol="XAUUSD",
+            side=OrderSide.BUY,
+            agent_id=simulated_agent_id(),
+            event_id="order_result:CO-MALFORMED",
+            received_at=datetime.now(UTC),
+        )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(AgentEvent).where(
+                AgentEvent.agent_id == simulated_agent_id(),
+                AgentEvent.event_id == "order_result:CO-MALFORMED",
+            )
+        )
+    ).scalar_one()
+    assert row.process_error is not None
+    assert row.processed_at is None
+
+
+async def test_set_initial_risk_is_a_no_op_when_the_position_cannot_be_found(
+    db_session: AsyncSession,
+) -> None:
+    """Defensive path: `_apply` always calls this immediately after
+    rebuilding the very position it looks up, so in practice it's always
+    found - this pins the fallback behaviour directly in case that
+    invariant ever breaks."""
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    consumer = _consumer(db_session)
+    await consumer._set_initial_risk_from_intent(
+        uuid.uuid4(),
+        account_id=refs.account_id,
+        broker_position_id="does-not-exist",
+        at=datetime.now(UTC),
+    )  # must not raise
