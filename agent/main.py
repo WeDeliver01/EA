@@ -46,14 +46,16 @@ async def run(*, settings: Settings, enable_transport: bool) -> None:
 
     transport: AgentTransport | None = None
 
-    async def emit_event(event_type: str, payload: dict) -> None:
+    async def emit_event(
+        event_type: str, payload: dict, *, correlation_id: str | None = None
+    ) -> None:
         if transport is None or not transport.connected:
             return
         envelope = Envelope(
             v=1,
             type=event_type,
             id=str(uuid.uuid4()),
-            correlation_id=None,
+            correlation_id=correlation_id,
             ts=payload.get("agent_time", ""),
             payload=payload,
         )
@@ -80,7 +82,11 @@ async def run(*, settings: Settings, enable_transport: bool) -> None:
 
     async def on_command(envelope: Envelope) -> None:
         result = await executor.handle(envelope)
-        await emit_event(f"event.{envelope.type.removeprefix('command.')}_result", result)
+        await emit_event(
+            f"event.{envelope.type.removeprefix('command.')}_result",
+            result,
+            correlation_id=envelope.id,
+        )
 
     if enable_transport:
         transport = AgentTransport(
