@@ -95,6 +95,11 @@ class TradeConstructionConfig(BaseModel):
     atr_stop_multiple: Decimal = Decimal("1.5")
     min_stop_atr_multiple: Decimal = Decimal("0.8")
     max_stop_atr_multiple: Decimal = Decimal("3.0")
+    breakeven_at_r: Decimal = Decimal("1.0")
+    breakeven_buffer_atr: Decimal = Decimal("0.1")
+    trail_mode: str = "atr"  # "" | "none" | "atr" | "structure"
+    trail_atr_multiple: Decimal = Decimal("2.0")
+    max_holding_bars: int = 96
     tp_mode: str = "partial_1r_runner"
     tp_ladder: tuple[tuple[Decimal, Decimal], ...] = (
         (Decimal("1.0"), Decimal("0.5")),
