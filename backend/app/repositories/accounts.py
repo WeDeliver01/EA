@@ -52,6 +52,22 @@ class AccountRepository:
             raise LookupError(f"instrument {instrument_id} not found")
         return instrument_row_to_spec(row)
 
+    async def get_instrument_id_by_symbol(self, account_id: UUID, symbol: str) -> UUID | None:
+        """The account's schema carries no direct instrument reference (see
+        SPEC-06 §4 "for v1, single instrument" - an operational convention,
+        not a stored one), so this joins through the account's broker,
+        which is how the agent WS route resolves `instrument_id` for a
+        deal event that only carries a symbol string."""
+        account = await self._session.get(Account, account_id)
+        if account is None:
+            return None
+        result = await self._session.execute(
+            select(Instrument.id).where(
+                Instrument.broker_id == account.broker_id, Instrument.symbol == symbol
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def load_active_risk_limits(self, account_id: UUID) -> tuple[UUID, RiskLimits]:
         stmt = select(RiskProfile).where(
             RiskProfile.account_id == account_id, RiskProfile.is_active.is_(True)

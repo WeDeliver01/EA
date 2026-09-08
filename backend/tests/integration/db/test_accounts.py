@@ -58,7 +58,12 @@ async def test_load_symbol_spec_and_risk_limits(db_session: AsyncSession) -> Non
 
 async def test_compute_risk_state_aggregates_todays_trades(db_session: AsyncSession) -> None:
     refs = await seed_minimal_refs(db_session)
-    now = datetime.now(UTC)
+    # Fixed, safely mid-day UTC: real datetime.now(UTC) here made this test
+    # flaky for the first ~2 hours after UTC midnight, since `day_start` is
+    # derived from `as_of` and the trade below is offset by -1h/-2h - a run
+    # between 00:00 and 01:59 UTC would compute a `day_start` that excludes
+    # a trade that closed "today" only in wall-clock terms.
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
 
     position = PositionRow(
         id=uuid4(),
@@ -123,3 +128,31 @@ async def test_apply_realised_pnl_updates_balance_equity_and_peak(
     state = await repo.load_account_state(refs.account_id, as_of=datetime.now(UTC))
     assert state.balance == Decimal("10200.00")
     assert state.equity == Decimal("10200.00")
+
+
+async def test_get_instrument_id_by_symbol_finds_the_seeded_instrument(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    repo = AccountRepository(db_session)
+    instrument_id = await repo.get_instrument_id_by_symbol(refs.account_id, "XAUUSD")
+    assert instrument_id == refs.instrument_id
+
+
+async def test_get_instrument_id_by_symbol_returns_none_for_an_unknown_symbol(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    repo = AccountRepository(db_session)
+    assert await repo.get_instrument_id_by_symbol(refs.account_id, "EURUSD") is None
+
+
+async def test_get_instrument_id_by_symbol_returns_none_for_an_unknown_account(
+    db_session: AsyncSession,
+) -> None:
+    repo = AccountRepository(db_session)
+    assert await repo.get_instrument_id_by_symbol(uuid4(), "XAUUSD") is None

@@ -338,9 +338,14 @@ verifiable by running tests locally.
 
 ### Phase 5 / MT5 bridge (partial)
 
-Built and verified against a live Windows host running MetaTrader5, logged
-into an FTMO-Demo account - not synthetic, not simulated. Only the
-MT5-facing half; the WSS half is untested (see below).
+The MT5-facing half (`agent/`) is built and verified against a live
+Windows host running MetaTrader5, logged into an FTMO-Demo account - not
+synthetic, not simulated. The backend-facing half (`app/transport/`, the
+real WSS gateway) is now built and tested too - handshake, envelope
+codec, command/reply correlation, event ingestion, all against real
+Postgres/Redis - but the two halves have never been connected to each
+other: nothing here has run against a live MT5 terminal, because no
+backend has been deployed anywhere reachable from the Windows host yet.
 
 - **`agent/mt5_client.py`** implements `SimulatedBroker`'s exact method
   surface (`place_order`, `modify_position`, `close_position`,
@@ -418,19 +423,112 @@ MT5-facing half; the WSS half is untested (see below).
   now passes `ruff check`, `ruff format --check` and `mypy` clean, same bar
   as `backend/`.
 
+### Phase 5 / the backend's WS gateway (`app/transport/`)
+
+Built against `agent/` exactly as it actually behaves - live-verified and
+read line by line - not SPEC-04's prose, which turned out to differ from
+the real, tested agent in two ways: reply events are named
+`event.<command_name>_result` (e.g. `event.place_order_result`), not
+`event.order_result`/`event.position_snapshot`/etc.; and the agent never
+set `correlation_id` on a reply, which `app/transport/ws_broker.py` needs
+to route a reply to the request that's waiting on it. Fixed on the agent
+side (`agent/main.py`'s `on_command`/`emit_event`, a small, safe change -
+that code path had no test coverage before or after) rather than worked
+around on the backend, since SPEC-04 §3 already specifies `correlation_id`
+for exactly this and there's no reason for two independently-maintained
+processes to agree on a worse contract than the one already written down.
+
+- **`app/execution/broker.py`** gained `AsyncBroker` (a `Protocol`) and
+  `AsyncSimulatedBrokerAdapter`. `dispatcher.py`/`position_manager.py`/
+  `reconciliation.py` now depend on and `await` the Protocol instead of
+  the concrete `SimulatedBroker` - the seam Phase 4's ADR entry promised
+  but that didn't actually exist yet, since every broker call there had
+  been a plain synchronous method call. `SimulatedBroker` itself stays
+  synchronous (no real I/O; every existing unit test still constructs and
+  calls it directly) - the adapter is the only new thing, and every
+  existing test's construction site now wraps it.
+- **`app/transport/envelope.py`** mirrors `agent/transport.py`'s
+  `Envelope` field-for-field. **`app/transport/registry.py`**
+  (`AgentConnectionRegistry`) tracks one live connection per account and
+  the requests it has in flight, correlated by envelope id -
+  `send_command` returns `None` on no connection, agent silence, or a
+  mid-flight disconnect, the same `BrokerFault.SILENT` contract
+  `SimulatedBroker` already models. **`app/transport/ws_broker.py`**
+  (`WSAgentBroker`) implements `AsyncBroker` over the registry -
+  `dispatcher.py`/`position_manager.py`/`reconciliation.py` need no
+  changes at all to use it instead of `AsyncSimulatedBrokerAdapter`.
+  **`app/transport/event_router.py`** routes unsolicited events
+  (`correlation_id is None` - not a reply to anything the backend asked
+  for): `event.heartbeat` into a new `AgentHeartbeat` row plus
+  `Agent.last_seen_at`, `event.deal` into `EventConsumer.record_deal`
+  (resolving `instrument_id` from the deal's own `symbol`, via a new
+  `AccountRepository.get_instrument_id_by_symbol` - the schema has no
+  direct account→instrument reference; SPEC-06 §4's "single instrument"
+  is an operational convention, not a stored one). Everything else
+  (`event.position_snapshot` unsolicited, `event.quote`,
+  `event.terminal_error`, `event.agent_error`, etc.) is logged and
+  dropped - a documented gap, not a silent one.
+- **`app/api/v1/agent_ws.py`** is the actual `/agent/ws` WebSocket route:
+  validates the SPEC-04 §2 handshake (`X-Agent-Key`/`X-Agent-Ts`/
+  `X-Agent-Nonce`/`X-Agent-Signature`) against `agents` and a
+  Redis-backed nonce store (`SET NX EX 120`, per spec) before ever
+  accepting the connection, then routes every frame either to the
+  registry (a reply) or the event router (unsolicited). Deliberately
+  sends no `hello` frame on accept, unlike SPEC-04 §2's prose: the real
+  agent's `AgentTransport.run()` treats every inbound frame uniformly as
+  a command to decode and dispatch, with no special handling for one -
+  sending it would just produce a confusing, wasted `event.hello_result`
+  round trip.
+- **`app/repositories/agents.py`** (`AgentRepository`) provisions and
+  looks up agent credentials - `create()` returns the plaintext
+  `api_key`/`hmac_secret` exactly once (SPEC-04 §2's "shown once"),
+  persisting only `api_key_hash` (SHA-256, for exact-match lookup) and
+  `hmac_secret_enc` (Fernet, keyed from `AGENT_SECRET_ENCRYPTION_KEY`).
+  `hmac_secret` is generated and stored as a `str`
+  (`secrets.token_urlsafe(32)`), not raw bytes - the agent reads it from
+  `.env` as a string and does `hmac_secret.encode()` before using it as
+  the HMAC key (`agent/transport.py`), so generating arbitrary random
+  bytes here would have produced a secret that doesn't even round-trip
+  through a `.env` file intact, let alone verify. Caught by writing a
+  real end-to-end handshake test against the actual route rather than
+  only unit-testing the crypto helpers in isolation.
+- **Tested for real, not just unit-in-isolation**: `tests/integration/api/
+  test_agent_ws.py` runs the actual FastAPI app (real Postgres, real
+  Redis) via Starlette's `TestClient` and a real WebSocket handshake -
+  accepted with a valid signature, rejected for a bad signature, an
+  unknown key, a stale timestamp, a reused nonce, and missing headers -
+  plus a live heartbeat round trip landing in the database. Every other
+  new module (`envelope`, `registry`, `ws_broker`, `event_router`,
+  `AgentRepository`, the handshake crypto in `app/core/security.py`) has
+  its own unit or integration tests against realistic, agent-shaped
+  payloads, not just internal round-trips.
+- **Not implemented**: reconnection replay (SPEC-04 §7.2-§7.4, same gap
+  as the agent side - the primitives exist, nothing calls them on
+  reconnect); rate limiting/backpressure on inbound `event.quote`; a
+  worker loop that actually calls `OutboxDispatcher.dispatch_pending`/
+  `Reconciler.run` on a schedule once an agent is connected (nothing
+  outside a test has ever called either - a pre-existing gap from Phase
+  4, not new here, but still the reason a signal becoming a live order
+  isn't fully automatic yet); `get_positions`/`get_deals` requests are
+  correlated by envelope id like everything else, which works correctly
+  as long as the backend never has two of the same type in flight to the
+  same agent at once - true today (nothing issues concurrent ones) but
+  worth knowing if that ever changes.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
-sensitivity) sub-stages; Phase 4's real transport, worker/queue
-infrastructure, and the two discrepancy kinds and retry logic listed above;
-Phase 5's WSS transport, reconnection replay, and rate limiting/backpressure
-(listed above); the MQL5 `ea/` fallback; the rest of Phase 6 (kill-switch
-triggers, alerting, Prometheus metrics, the nightly determinism replay
-job); the Next.js `frontend/` terminal (including any HTML/PDF rendering
-of the research report); and the demo/live measurement phases. `infra/`
-has a working dev `docker-compose.yml` and a stub `nginx/`/`prometheus/`
-layout but no production compose file, since there's still nothing running
-in `workers/` yet to put behind it.
+sensitivity) sub-stages; Phase 4's worker/queue infrastructure (a
+scheduler that actually calls `dispatch_pending`/`Reconciler.run`) and the
+two discrepancy kinds and retry logic listed above; Phase 5's reconnection
+replay and rate limiting/backpressure, on both the agent and backend
+sides (listed above); the MQL5 `ea/` fallback; the rest of Phase 6
+(kill-switch triggers, alerting, Prometheus metrics, the nightly
+determinism replay job); the Next.js `frontend/` terminal (including any
+HTML/PDF rendering of the research report); and the demo/live measurement
+phases. `infra/` has a working dev `docker-compose.yml` and a stub
+`nginx/`/`prometheus/` layout but no production compose file, since
+there's still nothing running in `workers/` yet to put behind it.
 
 ## Consequences
 
@@ -449,15 +547,22 @@ in `workers/` yet to put behind it.
   it could produce today would be about synthetic bars, not XAUUSD. The
   next real increment for the research question is running it against
   actual historical data with a persistence layer, not more in-memory code.
-- The MT5-facing half of Phase 5 is now real and live-verified - `agent/`
+- Both halves of Phase 5 now exist and are independently real: `agent/`
   can place, modify, close and read orders/positions/deals against an
-  actual FTMO-Demo account through the actual `MetaTrader5` package, not a
-  simulation. What's still missing is the other half: a deployed backend
-  for the agent's WSS transport to connect to, reconnection replay, and
-  test coverage for everything past `mt5_client.py`/`store.py` (see above).
-  `app/execution/`'s design held up - nothing in the dispatcher, event
-  consumer, position manager or reconciler needed to change to make this
-  possible.
+  actual FTMO-Demo account through the actual `MetaTrader5` package, and
+  `app/transport/` can authenticate a real WebSocket handshake, dispatch a
+  command, correlate its reply, and ingest heartbeats and deals - all
+  against real Postgres and Redis. `app/execution/`'s design held up
+  exactly as promised: nothing in the dispatcher, event consumer, position
+  manager or reconciler needed to change to plug in a real, network-backed
+  broker instead of the simulated one. What's still missing is the join:
+  a backend deployed somewhere the Windows host can reach, `agent/`
+  pointed at it with real credentials from `AgentRepository.create()`,
+  and a first real command/reply round trip over an actual socket - until
+  that happens, "the two halves talk to each other" is still a design
+  claim, not an observed fact. Also still missing: a scheduler that calls
+  `dispatch_pending`/`Reconciler.run` on its own (nothing outside a test
+  ever has), and reconnection replay on either side.
 - Before any of this trades real money, the deferred indicator/MT5
   verification (`SPEC-05` §5), the full golden-fixture set, the full
   `SPEC-07` §8 v1 experiment against real data, and the rest of Phase 5's

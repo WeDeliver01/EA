@@ -98,7 +98,7 @@ name = "domain imports nothing from the project"
 type = "forbidden"
 source_modules = ["app.domain"]
 forbidden_modules = [
-    "app.engines", "app.api", "app.core", "app.execution",
+    "app.engines", "app.api", "app.core", "app.execution", "app.transport",
     "app.research", "app.workers", "app.models", "app.repositories", "app.services",
 ]
 
@@ -107,7 +107,7 @@ name = "engines import only domain"
 type = "forbidden"
 source_modules = ["app.engines"]
 forbidden_modules = [
-    "app.api", "app.execution", "app.research", "app.workers",
+    "app.api", "app.execution", "app.transport", "app.research", "app.workers",
     "app.models", "app.repositories", "app.services",
     "sqlalchemy", "redis", "httpx", "fastapi",
 ]
@@ -116,17 +116,24 @@ forbidden_modules = [
 name = "nothing imports api"
 type = "forbidden"
 source_modules = [
-    "app.domain", "app.engines", "app.execution", "app.research",
+    "app.domain", "app.engines", "app.execution", "app.transport", "app.research",
     "app.workers", "app.models", "app.repositories", "app.services", "app.core",
 ]
 forbidden_modules = ["app.api"]
 
 [[tool.importlinter.contracts]]
-name = "layering: domain -> engines -> repositories -> (execution, research, services, workers) -> api"
+name = "execution/research/workers never import transport"
+type = "forbidden"
+source_modules = ["app.execution", "app.research", "app.workers"]
+forbidden_modules = ["app.transport"]
+
+[[tool.importlinter.contracts]]
+name = "layering: domain -> engines -> repositories -> (execution, research, workers) -> transport -> services -> api"
 type = "layers"
 layers = [
     "app.api",
     "app.services",
+    "app.transport",
     "app.execution | app.research | app.workers",
     "app.repositories",
     "app.engines",

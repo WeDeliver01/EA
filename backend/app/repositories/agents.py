@@ -5,6 +5,14 @@ in plaintext, at creation - the same "shown once" contract SPEC-04 §2
 describes. Only `api_key_hash` (SHA-256, for exact-match lookup) and
 `hmac_secret_enc` (Fernet, keyed from `AGENT_SECRET_ENCRYPTION_KEY`) are
 ever persisted.
+
+`hmac_secret` is a `str`, not raw bytes: the agent (`agent/config.py`)
+reads it from `.env` as a string and does `hmac_secret.encode()` before
+using it as the HMAC key (`agent/transport.py`'s `handshake_headers`) -
+generating it as arbitrary random bytes here would produce a secret the
+operator can't even paste into a `.env` file intact, let alone one that
+round-trips through `str.encode()` back to the same bytes the backend
+verifies against.
 """
 
 from __future__ import annotations
@@ -12,27 +20,28 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_secret, encrypt_secret, hash_api_key
-from app.models.tables import Agent
+from app.models.tables import Agent, AgentHeartbeat
 
 
 @dataclass(frozen=True, slots=True)
 class NewAgentCredentials:
     agent_id: UUID
     api_key: str
-    hmac_secret: bytes
+    hmac_secret: str
 
 
 @dataclass(frozen=True, slots=True)
 class AgentCredentials:
     agent_id: UUID
     account_id: UUID
-    hmac_secret: bytes
+    hmac_secret: str
 
 
 class AgentRepository:
@@ -49,14 +58,16 @@ class AgentRepository:
         transport: str = "python_ws",
     ) -> NewAgentCredentials:
         api_key = secrets.token_urlsafe(32)
-        hmac_secret = secrets.token_bytes(32)
+        hmac_secret = secrets.token_urlsafe(32)
         row = Agent(
             id=uuid4(),
             account_id=account_id,
             name=name,
             transport=transport,
             api_key_hash=hash_api_key(api_key),
-            hmac_secret_enc=encrypt_secret(hmac_secret, encryption_key=self._encryption_key),
+            hmac_secret_enc=encrypt_secret(
+                hmac_secret.encode(), encryption_key=self._encryption_key
+            ),
             is_active=True,
             created_at=created_at,
         )
@@ -80,7 +91,7 @@ class AgentRepository:
             account_id=row.account_id,
             hmac_secret=decrypt_secret(
                 bytes(row.hmac_secret_enc), encryption_key=self._encryption_key
-            ),
+            ).decode(),
         )
 
     async def touch_last_seen(self, agent_id: UUID, *, at: datetime) -> None:
@@ -88,4 +99,34 @@ class AgentRepository:
         if row is None:
             raise LookupError(f"agent {agent_id} not found")
         row.last_seen_at = at
+        await self._session.flush()
+
+    async def record_heartbeat(
+        self,
+        *,
+        agent_id: UUID,
+        account_id: UUID,
+        received_at: datetime,
+        agent_time: datetime,
+        broker_time: datetime | None,
+        terminal_connected: bool,
+        trade_allowed: bool,
+        balance: Decimal | None,
+        equity: Decimal | None,
+        open_position_count: int | None,
+    ) -> None:
+        self._session.add(
+            AgentHeartbeat(
+                agent_id=agent_id,
+                account_id=account_id,
+                received_at=received_at,
+                agent_time=agent_time,
+                broker_time=broker_time,
+                terminal_connected=terminal_connected,
+                trade_allowed=trade_allowed,
+                balance=balance,
+                equity=equity,
+                open_position_count=open_position_count,
+            )
+        )
         await self._session.flush()

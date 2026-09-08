@@ -10,10 +10,12 @@ from fastapi import FastAPI, Request
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.errors import install_error_handlers
+from app.api.v1.agent_ws import router as agent_ws_router
 from app.api.v1.system import router as system_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import make_redis_client
+from app.transport.registry import AgentConnectionRegistry
 
 logger = get_logger(service="api")
 
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_engine = engine
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
     app.state.redis = make_redis_client(settings.redis_url)
+    app.state.agent_registry = AgentConnectionRegistry()
 
     logger.info("api_startup", git_sha=settings.git_sha, environment=settings.environment)
     try:
@@ -58,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     install_error_handlers(app)
     app.include_router(system_router, prefix="/api/v1")
+    app.include_router(agent_ws_router, prefix="/api/v1")
 
     return app
 

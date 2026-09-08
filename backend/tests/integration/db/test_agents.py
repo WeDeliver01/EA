@@ -29,7 +29,7 @@ async def test_create_returns_plaintext_credentials_once(db_session: AsyncSessio
     )
 
     assert len(creds.api_key) > 20
-    assert len(creds.hmac_secret) == 32
+    assert len(creds.hmac_secret) > 20
 
 
 async def test_get_by_api_key_recovers_the_original_hmac_secret(db_session: AsyncSession) -> None:
