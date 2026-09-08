@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_secret, encrypt_secret, hash_api_key
-from app.models.tables import Agent, AgentHeartbeat
+from app.models.tables import Account, Agent, AgentHeartbeat
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,4 +129,46 @@ class AgentRepository:
                 open_position_count=open_position_count,
             )
         )
+        await self._session.flush()
+    async def record_heartbeat(
+        self,
+        *,
+        agent_id: UUID,
+        account_id: UUID,
+        received_at: datetime,
+        agent_time: datetime,
+        broker_time: datetime | None,
+        terminal_connected: bool,
+        trade_allowed: bool,
+        balance: Decimal | None,
+        equity: Decimal | None,
+        open_position_count: int | None,
+    ) -> None:
+        self._session.add(
+            AgentHeartbeat(
+                agent_id=agent_id,
+                account_id=account_id,
+                received_at=received_at,
+                agent_time=agent_time,
+                broker_time=broker_time,
+                terminal_connected=terminal_connected,
+                trade_allowed=trade_allowed,
+                balance=balance,
+                equity=equity,
+                open_position_count=open_position_count,
+            )
+        )
+
+        account = await self._session.get(Account, account_id)
+
+        if account is not None:
+            if balance is not None:
+                account.balance = balance
+
+            if equity is not None:
+                account.equity = equity
+
+            account.server_time = broker_time
+            account.state_reported_at = received_at
+
         await self._session.flush()

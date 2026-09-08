@@ -13,7 +13,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dt}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dt} -d ${POSTGRES_DB:-delicate_trader}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,9 +21,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    ports:
-      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"] 
+
     volumes:
       - redis_data:/data
     healthcheck:
@@ -54,7 +53,7 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8000:8000"
+      - "0.0.0.0:8000:8000"
     command:
       [
         "uvicorn",

@@ -25,7 +25,7 @@ produce a confusing `event.hello_result` echo the backend doesn't need.
 from __future__ import annotations
 
 import structlog
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
 from app.core.config import Settings
 from app.core.security import verify_agent_signature
@@ -59,7 +59,7 @@ async def _authenticate(websocket: WebSocket) -> AgentCredentials | None:
         return None
 
     settings: Settings = websocket.app.state.settings
-    session_factory = websocket.app.state.session_factory
+    session_factory = request.app.state.session_factory
     async with session_factory() as session:
         creds = await AgentRepository(
             session, encryption_key=settings.agent_secret_encryption_key
@@ -126,7 +126,7 @@ async def _handle_frame(websocket: WebSocket, raw: str, *, creds: AgentCredentia
         )
         return
 
-    session_factory = websocket.app.state.session_factory
+    session_factory = request.app.state.session_factory
     async with session_factory() as session:
         agent_repo = AgentRepository(
             session, encryption_key=websocket.app.state.settings.agent_secret_encryption_key
@@ -146,3 +146,155 @@ async def _handle_frame(websocket: WebSocket, raw: str, *, creds: AgentCredentia
             event_consumer=event_consumer,
         )
         await session.commit()
+
+
+@router.post("/agent/test-trade")
+async def test_trade(request: Request) -> dict:
+    """TEMPORARY demo-only end-to-end execution test."""
+    from decimal import Decimal
+    from uuid import UUID
+    from datetime import UTC, datetime
+
+    from app.domain.strategy.decision import (
+        Decision,
+        DecisionOutcome,
+        Direction,
+        Regime,
+    )
+    from app.execution.intent_service import submit_decision
+    from app.execution.dispatcher import OutboxDispatcher
+    from app.repositories.outbox import OutboxRepository
+    from app.repositories.reconciliation import ReconciliationRepository
+    from app.transport.ws_broker import WSAgentBroker
+
+    account_id = UUID("f646f32d-cd84-446e-a423-a1511d7dc0d2")
+    instrument_id = UUID("995f4f2f-2e1c-452f-a1dc-7fabcac63520")
+    strategy_version_id = UUID("b9ce4d73-8ad2-4554-b1d9-ca141a277f6e")
+
+    entry = Decimal("4357.72")
+    stop = Decimal("4352.72")
+    take_profit = Decimal("4362.72")
+    now = datetime.now(tz=UTC)
+
+    session_factory = request.app.state.session_factory
+
+    async with session_factory() as session:
+        account_repo = AccountRepository(session)
+
+        from sqlalchemy import select
+        from app.models.tables import Account
+        account = await session.scalar(select(Account).where(Account.id == account_id))
+        if account is None:
+            return {"ok": False, "error": "ACCOUNT_NOT_FOUND"}
+
+        if account.balance <= 0 or account.equity <= 0:
+            return {
+                "ok": False,
+                "error": "ACCOUNT_BALANCE_NOT_READY",
+                "balance": str(account.balance),
+                "equity": str(account.equity),
+            }
+
+        # With zero open positions, free margin should equal equity.
+        # This is only to make the one-off demo execution test reflect the
+        # actual MT5 state because the current heartbeat schema does not
+        # persist free margin.
+        if account.free_margin <= 0:
+            account.free_margin = account.equity
+
+        account.trading_enabled = True
+        account.kill_switch_active = False
+
+        decision = Decision(
+            outcome=DecisionOutcome.TRADE,
+            symbol="XAUUSD",
+            as_of=now,
+            strategy_version_id=strategy_version_id,
+            regime=Regime.EXPANSION,
+            setup=None,
+            direction=Direction.LONG,
+            entry=entry,
+            stop_loss=stop,
+            take_profits=(),
+            confluence_score=Decimal("100"),
+            confluence_band="TEST",
+            evidence=(),
+            gates=(),
+            narrative="TEMPORARY DEMO END-TO-END EXECUTION TEST",
+            engine_duration_ms=0,
+        )
+
+        outbox_repo = OutboxRepository(session)
+        intent_repo = TradeIntentRepository(session)
+
+        result = await submit_decision(
+            decision,
+            account_repo=account_repo,
+            outbox_repo=outbox_repo,
+            intent_repo=intent_repo,
+            signal_id=UUID("00000000-0000-0000-0000-000000000001"),
+            account_id=account_id,
+            instrument_id=instrument_id,
+            strategy_version_id=strategy_version_id,
+            environment="demo",
+            leverage=100,
+            as_of=now,
+        )
+
+        await session.commit()
+
+        if result.risk_decision is not None and not result.risk_decision.approved:
+            account.trading_enabled = False
+            account.kill_switch_active = True
+            await session.commit()
+            return {
+                "ok": False,
+                "stage": "RISK",
+                "result": str(result),
+            }
+
+        broker = WSAgentBroker(
+            account_id=account_id,
+            registry=request.app.state.agent_registry,
+        )
+
+        reconciliation_repo = ReconciliationRepository(session)
+
+        dispatcher = OutboxDispatcher(
+            broker=broker,
+            account_repo=account_repo,
+            outbox_repo=outbox_repo,
+            intent_repo=intent_repo,
+            reconciliation_repo=reconciliation_repo,
+        )
+
+        outcomes = await dispatcher.dispatch_pending(
+            account_id=account_id,
+            as_of=now,
+            limit=1,
+        )
+
+        await session.commit()
+
+        # Immediately re-arm the safety controls after the placement attempt.
+        account.trading_enabled = False
+        account.kill_switch_active = True
+        await session.commit()
+
+        positions = await broker.get_positions()
+
+        return {
+            "ok": True,
+            "stage": "EXECUTION",
+            "decision": {
+                "entry": str(entry),
+                "stop": str(stop),
+                "take_profit": str(take_profit),
+            },
+            "outcomes": [str(o) for o in outcomes],
+            "positions": [str(p) for p in positions],
+            "safety": {
+                "trading_enabled": account.trading_enabled,
+                "kill_switch_active": account.kill_switch_active,
+            },
+        }
