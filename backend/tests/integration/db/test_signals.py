@@ -151,3 +151,40 @@ async def test_no_setup_falls_back_to_reference_as_fingerprint(
     )
     assert recent[0].id == signal_id
     assert recent[0].setup_fingerprint == "ref-no-setup"
+
+
+async def test_get_returns_the_signal_record(db_session: AsyncSession) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    decision = _trade_decision(setup_fingerprint="fp-get")
+    repo = SignalRepository(db_session)
+    now = datetime.now(UTC)
+    signal_id = await repo.create(
+        decision,
+        reference="ref-get",
+        analysis_run_id=refs.analysis_run_id,
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        strategy_version_id=refs.strategy_version_id,
+        created_at=now,
+    )
+    await db_session.commit()
+
+    record = await repo.get(signal_id)
+
+    assert record is not None
+    assert record.id == signal_id
+    assert record.account_id == refs.account_id
+    assert record.instrument_id == refs.instrument_id
+    assert record.strategy_version_id == refs.strategy_version_id
+    assert record.direction == Direction.LONG
+    assert record.entry == Decimal("3418.20")
+    assert record.stop_loss == Decimal("3412.55")
+    assert record.take_profits == ()
+    assert record.confluence_score == Decimal("8.0")
+
+
+async def test_get_returns_none_for_an_unknown_signal(db_session: AsyncSession) -> None:
+    repo = SignalRepository(db_session)
+    assert await repo.get(uuid4()) is None
