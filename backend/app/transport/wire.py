@@ -13,6 +13,8 @@ from typing import Any
 
 from app.domain.execution.enums import DealType, OrderSide
 from app.domain.execution.intent import Fill
+from app.domain.market.bar import Bar
+from app.domain.market.enums import Timeframe
 from app.execution.broker import BrokerPositionSnapshot, OrderResult
 
 
@@ -52,6 +54,25 @@ def parse_fill(payload: dict[str, Any]) -> Fill:
         profit=Decimal(str(payload["profit"])),
         executed_at=datetime.fromisoformat(str(payload["executed_at"])),
         deal_type=DealType(payload["deal_type"]),
+    )
+
+
+def parse_bar(payload: dict[str, Any]) -> Bar:
+    return Bar(
+        symbol=str(payload["symbol"]),
+        timeframe=Timeframe(payload["timeframe"]),
+        open_time=datetime.fromisoformat(str(payload["open_time"])),
+        open=Decimal(str(payload["open"])),
+        high=Decimal(str(payload["high"])),
+        low=Decimal(str(payload["low"])),
+        close=Decimal(str(payload["close"])),
+        tick_volume=int(payload["tick_volume"]),
+        real_volume=(
+            int(payload["real_volume"]) if payload.get("real_volume") is not None else None
+        ),
+        spread_points=(
+            int(payload["spread_points"]) if payload.get("spread_points") is not None else None
+        ),
     )
 
 

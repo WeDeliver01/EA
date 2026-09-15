@@ -26,10 +26,12 @@ from typing import Any
 from uuid import UUID
 
 from app.domain.execution.intent import Fill, OrderIntent
+from app.domain.market.bar import Bar
+from app.domain.market.enums import Timeframe
 from app.execution.broker import BrokerPositionSnapshot, ModifyResult, OrderResult
 from app.transport.envelope import Envelope
 from app.transport.registry import AgentConnectionRegistry
-from app.transport.wire import parse_fill, parse_order_result, parse_position
+from app.transport.wire import parse_bar, parse_fill, parse_order_result, parse_position
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 10.0
 
@@ -141,3 +143,17 @@ class WSAgentBroker:
         if result is None:
             return ()
         return tuple(parse_fill(d) for d in result["deals"])
+
+    async def get_bars(self, symbol: str, timeframe: Timeframe, *, count: int) -> tuple[Bar, ...]:
+        """Not part of `AsyncBroker` (that Protocol is execution-order
+        shaped) - `app.workers.market_scanner` depends on its own, narrower
+        `AgentBarSource` Protocol instead, since `app.workers` may not
+        import `app.transport` (the import-linter layering contract) or
+        `app.execution` (siblings at the same layer) - this method is what
+        gets wired in from the app entrypoint to satisfy that Protocol."""
+        result = await self._command(
+            "get_bars", {"symbol": symbol, "timeframe": timeframe.value, "count": count}
+        )
+        if result is None:
+            return ()
+        return tuple(parse_bar(b) for b in result["bars"])
