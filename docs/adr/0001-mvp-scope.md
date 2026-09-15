@@ -65,9 +65,16 @@ now driven by a real scheduler loop running inside the `api` process.
 and intents are still recorded when it's off (per the "every decision is
 recorded" principle), but nothing is sent to the broker until an operator
 turns it on. It still can't survive a disconnect (no reconnection
-replay) and still has no live quote feed (see `event.quote` below), so
-the strategy engine derives its working quote from the last closed bar
-rather than a true live tick.
+replay).
+
+**Update 4:** a live quote cache now exists (`app/core/quotes.py`,
+Redis-backed), populated from the `symbols` field `event.heartbeat`
+already carries - see "Phase 5 / the live quote cache" below. The
+strategy engine now sees a real, recently-reported bid/ask/spread instead
+of one derived from the last closed bar whenever the cache has a fresh
+entry (falling back to the bar-derived one only when it doesn't), and a
+new `PRICE_STALE` execution guard cancels dispatch outright if that cache
+entry is missing or older than `QUOTE_STALE_SECONDS`.
 
 ### Why this boundary specifically
 
@@ -492,10 +499,13 @@ processes to agree on a worse contract than the one already written down.
   (resolving `instrument_id` from the deal's own `symbol`, via a new
   `AccountRepository.get_instrument_id_by_symbol` - the schema has no
   direct account→instrument reference; SPEC-06 §4's "single instrument"
-  is an operational convention, not a stored one). Everything else
-  (`event.position_snapshot` unsolicited, `event.quote`,
-  `event.terminal_error`, `event.agent_error`, etc.) is logged and
-  dropped - a documented gap, not a silent one.
+  is an operational convention, not a stored one). At the time this was
+  written, everything else (`event.position_snapshot` unsolicited,
+  `event.quote`, `event.terminal_error`, `event.agent_error`, etc.) was
+  logged and dropped; `event.quote` and `event.position_snapshot` are now
+  handled - see "Phase 5 / the live quote cache" below. `event.terminal_error`/
+  `event.agent_error` remain logged and dropped, a documented gap, not a
+  silent one.
 - **`app/api/v1/agent_ws.py`** is the actual `/agent/ws` WebSocket route:
   validates the SPEC-04 §2 handshake (`X-Agent-Key`/`X-Agent-Ts`/
   `X-Agent-Nonce`/`X-Agent-Signature`) against `agents` and a
@@ -605,14 +615,15 @@ each other:
   two real, separately-deployed processes and a real broker in between;
   this is the first time it has been observed working.
 
-The endpoint's hardcoded price levels are still stale and would need
-updating (or a live quote source, which doesn't exist yet - see
-`app/transport/event_router.py`'s "everything else is logged and
-dropped" for `event.quote`) to actually produce a filled order rather
-than a broker-level rejection. That's a fidelity gap in a
-`TEMPORARY demo-only` endpoint, not a gap in Phase 5 itself: the
-plumbing this phase exists to prove - authenticate, dispatch, execute,
-reply, correlate - is what the `retcode=10016` response demonstrates.
+The endpoint's hardcoded price levels are still stale (a live quote cache
+now exists - see "Phase 5 / the live quote cache" below - but this
+endpoint predates it and was never updated to use it, since it's a
+`TEMPORARY demo-only` path, not something worth extending) and would need
+updating to actually produce a filled order rather than a broker-level
+rejection. That's a fidelity gap in the endpoint, not a gap in Phase 5
+itself: the plumbing this phase exists to prove - authenticate, dispatch,
+execute, reply, correlate - is what the `retcode=10016` response
+demonstrates.
 
 ### Phase 5 / the autonomous scheduler
 
@@ -645,9 +656,10 @@ required new pieces on both sides of the existing connection:
   all (engines must stay pure/domain-only); this and
   `app/workers/market_state.py`'s `build_market_state()` (assembles a
   `MarketState` from persisted bars/positions/signals, deriving a `Quote`
-  from the latest closed bar when no live quote is available - there is
-  still no live quote cache, see `event.quote` below) live in
-  `app/workers/` instead.
+  from the latest closed bar when no live quote is passed in - a live
+  quote cache exists now, see "Phase 5 / the live quote cache" below,
+  but that lookup happens in the caller, `strategy_worker`, not here)
+  live in `app/workers/` instead.
 - **`app/workers/strategy_worker.py`: evaluate on candle close.**
   Consumes `stream:bars:closed` (skipping any timeframe that isn't the
   configured primary one - context timeframes exist only to feed
@@ -705,6 +717,65 @@ required new pieces on both sides of the existing connection:
   service - the existing `api` service now also runs the scheduler
   whenever those variables are configured.
 
+### Phase 5 / the live quote cache
+
+`PRICE_STALE` and a real (not bar-derived) `SPREAD_TOO_WIDE` both needed a
+live quote somewhere the backend could read it, which didn't exist. The
+obvious plan was a new agent-side quote poller emitting SPEC-04 §5's
+`event.quote` (`{symbol, bid, ask, time}`, throttled to 4/sec) - until
+checking what `agent/heartbeat.py` already sends turned up that
+`event.heartbeat`'s own payload already carries a `symbols` array with
+exactly that shape, one entry per watched symbol, fetched via
+`MT5Client.get_tick()` on every beat (`AGENT_HEARTBEAT_INTERVAL_MS`, 2s by
+default - comfortably inside `QUOTE_STALE_SECONDS`'s 5s default). The
+backend was simply never reading that field. So instead of building a new
+agent-side stream, this pass:
+
+- Added `app/core/quotes.py`: a small Redis-backed cache
+  (`quote:{account_id}:{symbol}` -> bid/ask/server_time/received_at,
+  TTL'd well past `QUOTE_STALE_SECONDS` so a stale key and a missing key
+  fail the same way). Lives in `app/core/` rather than `app/repositories/`
+  because it wraps Redis, not Postgres, and because `app/core/` is the
+  only place both `app/transport/` (writes it) and `app/execution/`
+  (reads it) can both import without breaking the layering contract -
+  `execution`/`research`/`workers` may never import `transport`.
+- `app/transport/event_router.py`'s `_handle_heartbeat` now also caches
+  every entry in the heartbeat's `symbols` field. A standalone
+  `event.quote` message is handled the same way if one is ever sent
+  (nothing currently sends one standalone - real quotes already flow via
+  heartbeat), replacing the "logged and dropped" behaviour the previous
+  pass documented; the test that used `event.quote` as its example of an
+  unhandled event type was updated to use `event.terminal_error` instead,
+  since that example stopped being true.
+- `app/transport/event_router.py` also gives unsolicited
+  `event.position_snapshot` (SPEC-04 §7.3's post-reconnect push) its own
+  log line instead of falling into the generic "unhandled" catch-all -
+  but still doesn't act on it: `app/services/reconciliation_worker.py`
+  already polls `broker.get_positions()` on its own interval, so an
+  unsolicited push would be redundant with a poll that already happens.
+  Reconnection replay itself (the agent detecting a reconnect and sending
+  this push in the first place) remains unbuilt on both sides.
+- `app/workers/strategy_worker.py` now looks up the live cache before
+  calling `build_market_state`, passing a live `Quote` through when the
+  account/symbol has one and leaving it `None` (bar-derived fallback,
+  unchanged) otherwise - so `MarketState.quote.spread` reflects the
+  broker's actual currently-reported spread wherever a beat has landed
+  recently, which is what `SPREAD_TOO_WIDE` (already implemented as a
+  strategy gate, `app/engines/gates/strategy_gates.py`) evaluates against.
+- `app/execution/dispatcher.py`'s `execution_guard` gained a `PRICE_STALE`
+  check - opt-in via a `redis` client and `symbol` on the call (both
+  default to skipping the check, so every pre-existing caller and test
+  keeps working unchanged): missing or older-than-`QUOTE_STALE_SECONDS`
+  cancels the same way `KILL_SWITCH_ACTIVE`/`TRADING_DISABLED` do.
+  `app/services/scheduler.py` passes both in, so the live scheduler gets
+  this gate automatically; nothing else currently does.
+
+`AGENT_DISCONNECTED` and `BROKER_DISCONNECTED` (the same SPEC-06 §3 table's
+other two Phase-5-dependent gates) are not implemented yet even though the
+same heartbeat now carries what they'd need (`terminal_connected`,
+`trade_allowed`, agent last-seen) - out of scope for this pass, a
+documented gap, not a silent one.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
@@ -712,18 +783,19 @@ sensitivity) sub-stages; the two discrepancy kinds and retry logic listed
 above (a scheduler that calls `dispatch_pending`/`Reconciler.run` now
 exists - see "Phase 5 / the autonomous scheduler"); Phase 5's reconnection
 replay and rate limiting/backpressure, on both the agent and backend
-sides (listed above), and a live quote feed (`event.quote` handling -
-the scheduler derives its working quote from the last closed bar
-instead); the MQL5 `ea/` fallback; the rest of Phase 6 (kill-switch
-triggers, alerting, Prometheus metrics, the nightly determinism replay
-job, a `position_monitor` loop for intra-candle position management);
-the Next.js `frontend/` terminal (including any HTML/PDF rendering of
-the research report); and the demo/live measurement phases. `infra/`
-has a working dev `docker-compose.yml` and a stub `nginx/`/`prometheus/`
-layout but no production compose file; the scheduler runs inside the
-existing `api` service rather than a separate one (see above), so there
-is still nothing else running in `workers/` as its own process to put
-behind a production compose file.
+sides (listed above - a live quote cache exists now, see "Phase 5 / the
+live quote cache", but `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED` still
+don't, and reconnection replay itself is still unbuilt); the MQL5 `ea/`
+fallback; the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
+metrics, the nightly determinism replay job, a `position_monitor` loop
+for intra-candle position management); the Next.js `frontend/` terminal
+(including any HTML/PDF rendering of the research report); and the
+demo/live measurement phases. `infra/` has a working dev
+`docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
+production compose file; the scheduler runs inside the existing `api`
+service rather than a separate one (see above), so there is still
+nothing else running in `workers/` as its own process to put behind a
+production compose file.
 
 ## Consequences
 
@@ -742,6 +814,12 @@ behind a production compose file.
   trading itself is switched off. A fresh deployment with no
   `SCHEDULER_*`/`GLOBAL_TRADING_ENABLED` configured stays exactly as
   inert as before this pass - both default to off/unset.
+- The strategy engine now evaluates against a real, recently-reported
+  bid/ask/spread rather than one synthesised from the last closed bar's
+  close price, whenever the live quote cache has a fresh entry for the
+  account/symbol - and a stale or missing one now actually blocks
+  dispatch (`PRICE_STALE`) instead of silently trading on data nobody
+  checked the age of.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and

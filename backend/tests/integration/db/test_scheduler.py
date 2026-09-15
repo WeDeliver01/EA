@@ -41,6 +41,7 @@ async def test_start_and_stop_do_not_hang_or_raise(
         reconciliation_interval_seconds=0.05,
         candle_close_grace_ms=1500,
         global_trading_enabled=False,
+        quote_stale_seconds=5,
     )
     scheduler = Scheduler(
         session_factory=async_sessionmaker(db_engine, expire_on_commit=False),

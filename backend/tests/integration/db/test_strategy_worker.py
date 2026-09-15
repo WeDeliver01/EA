@@ -22,6 +22,7 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.core.quotes import store_quote
 from app.core.streams import (
     STREAM_BARS_CLOSED,
     STREAM_INTENTS_PENDING,
@@ -270,6 +271,53 @@ async def test_context_timeframe_close_is_a_noop(
         {"a": str(refs.account_id)},
     )
     assert rows.scalar_one() == 0
+
+
+async def test_a_fresh_cached_quote_is_preferred_over_the_bar_derived_one(
+    db_session: AsyncSession, db_engine: AsyncEngine, redis_client: Redis
+) -> None:
+    """When `event.heartbeat` has populated the live quote cache
+    (`app/core/quotes.py`) for this account/symbol, `build_market_state`
+    must be called with it rather than falling back to deriving one from
+    the just-closed bar's close price - a real live spread instead of the
+    synthetic one, and a `received_at` that actually reflects freshness."""
+    as_of = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    refs = await _seed_and_upsert_primary_bar(db_session, as_of=as_of)
+    await store_quote(
+        redis_client,
+        account_id=refs.account_id,
+        symbol="XAUUSD",
+        bid=Decimal("3450.10"),
+        ask=Decimal("3450.35"),
+        server_time=as_of,
+        received_at=as_of,
+    )
+
+    fake_engine = _FakeEngine(
+        _decision(DecisionOutcome.WAIT, strategy_version_id=refs.strategy_version_id)
+    )
+    worker = _worker(redis=redis_client, db_engine=db_engine, engine=fake_engine)
+
+    await ensure_consumer_group(redis_client, STREAM_BARS_CLOSED, CONSUMER_GROUP)
+    await xadd(
+        redis_client,
+        STREAM_BARS_CLOSED,
+        _bars_closed_fields(
+            account_id=refs.account_id,
+            instrument_id=refs.instrument_id,
+            symbol="XAUUSD",
+            timeframe=Timeframe.M15,
+            as_of=as_of,
+        ),
+    )
+
+    processed = await worker.run_once(block_ms=100)
+
+    assert processed == 1
+    assert len(fake_engine.calls) == 1
+    quote = fake_engine.calls[0].quote
+    assert quote.bid == Decimal("3450.10")
+    assert quote.ask == Decimal("3450.35")
 
 
 async def test_an_already_held_lock_is_skipped_not_reprocessed(

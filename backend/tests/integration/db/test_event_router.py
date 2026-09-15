@@ -7,9 +7,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.quotes import get_quote
 from app.execution.event_consumer import EventConsumer
 from app.models.tables import Agent, AgentHeartbeat, PositionRow
 from app.repositories.accounts import AccountRepository
@@ -37,7 +39,7 @@ def _event_consumer(db_session: AsyncSession) -> EventConsumer:
 
 
 async def test_heartbeat_event_is_recorded_and_touches_last_seen(
-    db_session: AsyncSession,
+    db_session: AsyncSession, redis_client: Redis
 ) -> None:
     refs = await seed_minimal_refs(db_session)
     agent_repo = AgentRepository(db_session, encryption_key=_KEY)
@@ -83,6 +85,7 @@ async def test_heartbeat_event_is_recorded_and_touches_last_seen(
         agent_repo=agent_repo,
         account_repo=AccountRepository(db_session),
         event_consumer=_event_consumer(db_session),
+        redis=redis_client,
     )
     await db_session.commit()
 
@@ -101,8 +104,146 @@ async def test_heartbeat_event_is_recorded_and_touches_last_seen(
     assert agent_row.last_seen_at is not None
 
 
+async def test_heartbeat_caches_a_live_quote_per_symbol(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    """`agent/heartbeat.py` already reports a `{symbol, bid, ask, time}`
+    entry per watched symbol on every beat - this is what makes PRICE_STALE
+    and a real live spread possible without a separate quote stream."""
+    refs = await seed_minimal_refs(db_session)
+    agent_repo = AgentRepository(db_session, encryption_key=_KEY)
+    creds = await agent_repo.create(
+        account_id=refs.account_id, name="win-vps-quote", created_at=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    envelope = Envelope(
+        v=1,
+        type="event.heartbeat",
+        id="evt-quote",
+        correlation_id=None,
+        ts="2026-09-07T09:14:22.318Z",
+        payload={
+            "agent_time": "2026-09-07T09:14:22.318000+00:00",
+            "broker_time": "2026-09-07T12:14:22+00:00",
+            "terminal_connected": True,
+            "trade_allowed": True,
+            "algo_trading_enabled": True,
+            "build": 4620,
+            "account": {},
+            "open_position_count": 0,
+            "open_position_hash": "",
+            "symbols": [
+                {
+                    "symbol": "XAUUSD",
+                    "bid": "3400.10",
+                    "ask": "3400.35",
+                    "time": "2026-09-07T12:14:22+00:00",
+                }
+            ],
+            "agent_version": "1.4.2",
+        },
+    )
+
+    await route_unsolicited_event(
+        envelope,
+        agent_id=creds.agent_id,
+        account_id=refs.account_id,
+        agent_repo=agent_repo,
+        account_repo=AccountRepository(db_session),
+        event_consumer=_event_consumer(db_session),
+        redis=redis_client,
+    )
+    await db_session.commit()
+
+    cached = await get_quote(redis_client, account_id=refs.account_id, symbol="XAUUSD")
+    assert cached is not None
+    assert cached.bid == Decimal("3400.10")
+    assert cached.ask == Decimal("3400.35")
+
+
+async def test_standalone_quote_event_is_cached(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    """SPEC-04 §5 also describes a separate, throttled `event.quote`
+    stream - nothing in this codebase emits one standalone today (real
+    quotes already flow via heartbeat), but a genuine one must still be
+    handled the same way, not dropped."""
+    refs = await seed_minimal_refs(db_session)
+    agent_repo = AgentRepository(db_session, encryption_key=_KEY)
+    creds = await agent_repo.create(
+        account_id=refs.account_id, name="win-vps-quote-2", created_at=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    envelope = Envelope(
+        v=1,
+        type="event.quote",
+        id="evt-quote-2",
+        correlation_id=None,
+        ts="2026-09-07T09:14:22.318Z",
+        payload={
+            "symbol": "XAUUSD",
+            "bid": "3401.00",
+            "ask": "3401.30",
+            "time": "2026-09-07T12:15:00+00:00",
+        },
+    )
+
+    await route_unsolicited_event(
+        envelope,
+        agent_id=creds.agent_id,
+        account_id=refs.account_id,
+        agent_repo=agent_repo,
+        account_repo=AccountRepository(db_session),
+        event_consumer=_event_consumer(db_session),
+        redis=redis_client,
+    )
+
+    cached = await get_quote(redis_client, account_id=refs.account_id, symbol="XAUUSD")
+    assert cached is not None
+    assert cached.bid == Decimal("3401.00")
+    assert cached.ask == Decimal("3401.30")
+
+
+async def test_unsolicited_position_snapshot_is_logged_not_acted_on(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    """Reconciliation already polls `broker.get_positions()` on its own
+    interval - an unsolicited push (SPEC-04 §7.3's post-reconnect behaviour,
+    not built) would be redundant with that, so this must not raise and
+    must not touch positions."""
+    refs = await seed_minimal_refs(db_session)
+    agent_repo = AgentRepository(db_session, encryption_key=_KEY)
+    creds = await agent_repo.create(
+        account_id=refs.account_id, name="win-vps-snapshot", created_at=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    envelope = Envelope(
+        v=1,
+        type="event.position_snapshot",
+        id="evt-snap-1",
+        correlation_id=None,
+        ts="2026-09-07T09:14:22.318Z",
+        payload={"positions": [{"broker_position_id": "1"}]},
+    )
+
+    await route_unsolicited_event(
+        envelope,
+        agent_id=creds.agent_id,
+        account_id=refs.account_id,
+        agent_repo=agent_repo,
+        account_repo=AccountRepository(db_session),
+        event_consumer=_event_consumer(db_session),
+        redis=redis_client,
+    )  # must not raise
+
+    assert (await db_session.execute(select(PositionRow))).scalars().all() == []
+
+
 async def test_heartbeat_with_no_broker_time_is_recorded_as_null(
-    db_session: AsyncSession,
+    db_session: AsyncSession, redis_client: Redis
 ) -> None:
     refs = await seed_minimal_refs(db_session)
     agent_repo = AgentRepository(db_session, encryption_key=_KEY)
@@ -139,6 +280,7 @@ async def test_heartbeat_with_no_broker_time_is_recorded_as_null(
         agent_repo=agent_repo,
         account_repo=AccountRepository(db_session),
         event_consumer=_event_consumer(db_session),
+        redis=redis_client,
     )
     await db_session.commit()
 
@@ -151,7 +293,9 @@ async def test_heartbeat_with_no_broker_time_is_recorded_as_null(
     assert heartbeat.balance is None
 
 
-async def test_deal_event_creates_an_orphaned_position(db_session: AsyncSession) -> None:
+async def test_deal_event_creates_an_orphaned_position(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
     """A manual trade a human placed in the terminal, with no matching
     intent - discovered via the deal-watcher's independent poll, not a
     command reply. `record_deal` rebuilds positions from deals regardless
@@ -193,6 +337,7 @@ async def test_deal_event_creates_an_orphaned_position(db_session: AsyncSession)
         agent_repo=agent_repo,
         account_repo=AccountRepository(db_session),
         event_consumer=_event_consumer(db_session),
+        redis=redis_client,
     )
     await db_session.commit()
 
@@ -203,7 +348,9 @@ async def test_deal_event_creates_an_orphaned_position(db_session: AsyncSession)
     assert row.volume == Decimal("0.05")
 
 
-async def test_unhandled_event_type_is_a_no_op(db_session: AsyncSession) -> None:
+async def test_unhandled_event_type_is_a_no_op(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
     refs = await seed_minimal_refs(db_session)
     agent_repo = AgentRepository(db_session, encryption_key=_KEY)
     creds = await agent_repo.create(
@@ -213,11 +360,11 @@ async def test_unhandled_event_type_is_a_no_op(db_session: AsyncSession) -> None
 
     envelope = Envelope(
         v=1,
-        type="event.quote",
+        type="event.terminal_error",
         id="evt-4",
         correlation_id=None,
         ts="2026-09-07T09:14:22.318Z",
-        payload={"symbol": "XAUUSD", "bid": "3400", "ask": "3400.5"},
+        payload={"message": "connection reset"},
     )
 
     await route_unsolicited_event(
@@ -227,11 +374,12 @@ async def test_unhandled_event_type_is_a_no_op(db_session: AsyncSession) -> None
         agent_repo=agent_repo,
         account_repo=AccountRepository(db_session),
         event_consumer=_event_consumer(db_session),
+        redis=redis_client,
     )  # must not raise
 
 
 async def test_deal_for_a_symbol_with_no_matching_instrument_is_dropped(
-    db_session: AsyncSession,
+    db_session: AsyncSession, redis_client: Redis
 ) -> None:
     refs = await seed_minimal_refs(db_session)
     agent_repo = AgentRepository(db_session, encryption_key=_KEY)
@@ -270,6 +418,7 @@ async def test_deal_for_a_symbol_with_no_matching_instrument_is_dropped(
         agent_repo=agent_repo,
         account_repo=AccountRepository(db_session),
         event_consumer=_event_consumer(db_session),
+        redis=redis_client,
     )  # must not raise
 
     assert (await db_session.execute(select(PositionRow))).scalars().all() == []

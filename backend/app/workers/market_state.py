@@ -13,15 +13,16 @@ enforces this), and this function's entire job is I/O. It lives in
 own documented gap (see the ADR): no calendar/news ingestion exists
 anywhere in this codebase yet, live or backtested.
 
-`quote` is optional: no live quote cache exists yet (`event.quote` is
-still logged and dropped, per `app/transport/event_router.py`), so by
-default this derives one from the primary timeframe's just-closed bar -
-`bid = close`, `ask = close + spread_points * point` (MT5's own bars are
-bid-based, spread reported separately) - the same "quote from the last
-closed bar" approach `app/research/backtester.py`'s `_build_state()`
-already uses, just with real reported spread instead of a cost-model
-estimate. A caller that does have a fresher live quote (once that cache
-exists) can pass one in directly.
+`quote` is optional: `strategy_worker` passes a live one when the account/
+symbol has a fresh entry in the live quote cache (`app/core/quotes.py`,
+populated from `event.heartbeat` - see `app/transport/event_router.py`).
+When there is none (a cold cache right after startup, or a symbol the
+agent isn't reporting), this derives one from the primary timeframe's
+just-closed bar instead - `bid = close`, `ask = close + spread_points *
+point` (MT5's own bars are bid-based, spread reported separately) - the
+same "quote from the last closed bar" approach `app/research/backtester.py`'s
+`_build_state()` already uses, just with real reported spread instead of a
+cost-model estimate.
 """
 
 from __future__ import annotations

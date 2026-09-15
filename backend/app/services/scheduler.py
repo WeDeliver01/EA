@@ -76,6 +76,7 @@ class SchedulerConfig:
     reconciliation_interval_seconds: float
     candle_close_grace_ms: int
     global_trading_enabled: bool
+    quote_stale_seconds: int
 
     @classmethod
     def from_settings(cls, settings: Settings) -> SchedulerConfig | None:
@@ -107,6 +108,7 @@ class SchedulerConfig:
             reconciliation_interval_seconds=float(settings.reconciliation_interval_seconds),
             candle_close_grace_ms=settings.candle_close_grace_ms,
             global_trading_enabled=settings.global_trading_enabled,
+            quote_stale_seconds=settings.quote_stale_seconds,
         )
 
 
@@ -225,9 +227,13 @@ class Scheduler:
                             outbox_repo=OutboxRepository(session),
                             intent_repo=TradeIntentRepository(session),
                             reconciliation_repo=ReconciliationRepository(session),
+                            redis=self._redis,
+                            quote_stale_seconds=self._config.quote_stale_seconds,
                         )
                         guard = await dispatcher.execution_guard(
-                            self._config.account_id, as_of=datetime.now(UTC)
+                            self._config.account_id,
+                            as_of=datetime.now(UTC),
+                            symbol=self._config.symbol,
                         )
                         if guard.passed:
                             await dispatcher.dispatch_pending(

@@ -144,6 +144,7 @@ async def _handle_frame(websocket: WebSocket, raw: str, *, creds: AgentCredentia
             agent_repo=agent_repo,
             account_repo=AccountRepository(session),
             event_consumer=event_consumer,
+            redis=websocket.app.state.redis,
         )
         await session.commit()
 

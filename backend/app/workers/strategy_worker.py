@@ -15,9 +15,11 @@ import structlog
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.quotes import get_quote
 from app.core.redis import redis_lock
 from app.core.streams import STREAM_BARS_CLOSED, STREAM_INTENTS_PENDING, xack, xadd, xreadgroup
 from app.domain.market.enums import Timeframe
+from app.domain.market.quote import Quote
 from app.domain.strategy.enums import DecisionOutcome
 from app.engines.strategy_engine import StrategyEngine
 from app.repositories.accounts import AccountRepository
@@ -108,6 +110,17 @@ class StrategyWorker:
                 signal_repo = SignalRepository(session)
                 analysis_run_repo = AnalysisRunRepository(session)
 
+                live_quote: Quote | None = None
+                cached = await get_quote(self._redis, account_id=account_id, symbol=symbol)
+                if cached is not None:
+                    live_quote = Quote(
+                        symbol=cached.symbol,
+                        bid=cached.bid,
+                        ask=cached.ask,
+                        server_time=cached.server_time,
+                        received_at=cached.received_at,
+                    )
+
                 state = await build_market_state(
                     account_repo=account_repo,
                     market_data_repo=market_data_repo,
@@ -119,6 +132,7 @@ class StrategyWorker:
                     primary_tf=self._config.primary_tf,
                     context_timeframes=self._config.context_timeframes,
                     as_of=as_of,
+                    quote=live_quote,
                 )
 
                 started = time.monotonic()

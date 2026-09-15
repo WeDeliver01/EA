@@ -43,6 +43,7 @@ def test_fully_configured_settings_parses_correctly() -> None:
         reconciliation_interval_seconds=45,
         candle_close_grace_ms=2000,
         global_trading_enabled=True,
+        quote_stale_seconds=7,
     )
 
     config = SchedulerConfig.from_settings(settings)
@@ -60,6 +61,7 @@ def test_fully_configured_settings_parses_correctly() -> None:
     assert config.reconciliation_interval_seconds == 45.0
     assert config.candle_close_grace_ms == 2000
     assert config.global_trading_enabled is True
+    assert config.quote_stale_seconds == 7
 
 
 def test_context_timeframes_handles_whitespace_and_trailing_comma() -> None:

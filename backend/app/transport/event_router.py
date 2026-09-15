@@ -4,12 +4,25 @@ land. A reply to a backend-initiated command never reaches this - the WS
 route resolves those directly via the registry, keyed by `correlation_id`,
 before this is ever called.
 
-Only `event.heartbeat` and `event.deal` are handled - the two SPEC-04 §5
-events this MVP's execution path actually depends on (liveness, and the
-"how did a position really close" source of truth). Everything else
-(`event.position_snapshot` unsolicited, `event.quote`, `event.terminal_error`,
-`event.agent_error`, etc.) is logged and dropped - a documented gap, not a
-silent one (see docs/adr/0001-mvp-scope.md).
+`event.heartbeat`, `event.deal` and `event.quote` are handled.
+`event.heartbeat` also caches a live quote (`app.core.quotes`) for every
+symbol in its own `symbols` field - `agent/heartbeat.py` already reports
+`{symbol, bid, ask, time}` per watched symbol on every beat, so this is a
+real live tick every `AGENT_HEARTBEAT_INTERVAL_MS` without needing the
+agent to also emit a separate, throttled `event.quote` stream (SPEC-04 §5
+still describes one; a standalone `event.quote` is handled the same way if
+the agent ever sends one, but nothing currently does).
+
+`event.position_snapshot` sent unsolicited (SPEC-04 §7.3's post-reconnect
+push) is logged distinctly rather than acted on: reconciliation already
+polls `broker.get_positions()` itself on its own interval
+(`app.services.reconciliation_worker`), so an unsolicited snapshot would
+be redundant with a poll that already happens - reconnection replay itself
+(replaying the missed-event window) remains unbuilt on both sides, a
+documented gap (see docs/adr/0001-mvp-scope.md).
+
+Everything else (`event.terminal_error`, `event.agent_error`, etc.) is
+logged and dropped - a documented gap, not a silent one.
 """
 
 from __future__ import annotations
@@ -20,7 +33,9 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from redis.asyncio import Redis
 
+from app.core.quotes import store_quote
 from app.execution.event_consumer import EventConsumer
 from app.repositories.accounts import AccountRepository
 from app.repositories.agents import AgentRepository
@@ -38,10 +53,28 @@ async def route_unsolicited_event(
     agent_repo: AgentRepository,
     account_repo: AccountRepository,
     event_consumer: EventConsumer,
+    redis: Redis,
 ) -> None:
     if envelope.type == "event.heartbeat":
         await _handle_heartbeat(
-            envelope.payload, agent_id=agent_id, account_id=account_id, agent_repo=agent_repo
+            envelope.payload,
+            agent_id=agent_id,
+            account_id=account_id,
+            agent_repo=agent_repo,
+            redis=redis,
+        )
+        return
+
+    if envelope.type == "event.quote":
+        await _cache_quote(envelope.payload, account_id=account_id, redis=redis)
+        return
+
+    if envelope.type == "event.position_snapshot":
+        logger.info(
+            "agent_ws.unsolicited_position_snapshot",
+            agent_id=str(agent_id),
+            account_id=str(account_id),
+            position_count=len(envelope.payload.get("positions", [])),
         )
         return
 
@@ -75,7 +108,12 @@ async def route_unsolicited_event(
 
 
 async def _handle_heartbeat(
-    payload: dict[str, Any], *, agent_id: UUID, account_id: UUID, agent_repo: AgentRepository
+    payload: dict[str, Any],
+    *,
+    agent_id: UUID,
+    account_id: UUID,
+    agent_repo: AgentRepository,
+    redis: Redis,
 ) -> None:
     account = payload.get("account") or {}
     now = datetime.now(tz=UTC)
@@ -94,3 +132,24 @@ async def _handle_heartbeat(
         open_position_count=payload.get("open_position_count"),
     )
     await agent_repo.touch_last_seen(agent_id, at=now)
+
+    for symbol_quote in payload.get("symbols") or ():
+        await _cache_quote(symbol_quote, account_id=account_id, redis=redis, received_at=now)
+
+
+async def _cache_quote(
+    payload: dict[str, Any],
+    *,
+    account_id: UUID,
+    redis: Redis,
+    received_at: datetime | None = None,
+) -> None:
+    await store_quote(
+        redis,
+        account_id=account_id,
+        symbol=str(payload["symbol"]),
+        bid=Decimal(str(payload["bid"])),
+        ask=Decimal(str(payload["ask"])),
+        server_time=datetime.fromisoformat(str(payload["time"])),
+        received_at=received_at or datetime.now(tz=UTC),
+    )

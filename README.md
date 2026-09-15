@@ -59,13 +59,20 @@ inside the `api` process (see the ADR for why it can't be a separate
 service). `GLOBAL_TRADING_ENABLED` now actually gates the dispatch step
 (default off); `SCHEDULER_ACCOUNT_ID`/`SCHEDULER_INSTRUMENT_ID`/
 `SCHEDULER_STRATEGY_VERSION_ID`/`SCHEDULER_SYMBOL` (all unset by default)
-gate the scheduler starting at all.
-**What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is
-not implemented on either side; there is no live quote feed, so the
-scheduler derives its working quote from the last closed bar rather than
-a true live tick (see the ADR's `event.quote` discussion); and
-`position_monitor` (intra-candle position management on its own timer)
-is still deferred (see the ADR for the full breakdown).
+gate the scheduler starting at all. There's also now a live quote cache
+(`app/core/quotes.py`, Redis-backed) fed from `event.heartbeat`'s own
+`symbols` field - `agent/heartbeat.py` already reports a live bid/ask/time
+per watched symbol every beat, so no separate quote stream was needed.
+The strategy engine prefers this real, recently-reported spread over the
+bar-derived one whenever it's fresh, and a new `PRICE_STALE` execution
+guard now actually cancels dispatch if the cached quote is missing or too
+old, instead of silently trading on stale data.
+**What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is not
+implemented on either side; `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED`
+(the other two Phase-5-dependent hard gates) aren't wired up yet even
+though the heartbeat now carries what they'd need; and `position_monitor`
+(intra-candle position management on its own timer) is still deferred
+(see the ADR for the full breakdown).
 
 | Phase | Status |
 |---|---|
@@ -74,7 +81,7 @@ is still deferred (see the ADR for the full breakdown).
 | 2 Strategy engine | ✅ Done |
 | 3 Research engine | ✅ Done (synthetic data only - see ADR) |
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
-| 5 MT5 bridge | 🟡 Connected, trading autonomously - reconnection replay and a live quote feed still missing - see ADR |
+| 5 MT5 bridge | 🟡 Connected, trading autonomously with a live quote feed - reconnection replay and position_monitor still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
 | 7 Terminal | Not started |
 | 8 Demo, then live | Not started |
@@ -197,18 +204,19 @@ detect-decide-execute-reconcile loop continuously with no human involved
    then send a full position snapshot and a deal batch covering the
    disconnected window with 5-minute overlap. `agent/store.py` has the
    primitives (`unacked_events`/`ack_event`); nothing calls them yet.
-2. **A live quote source.** `event.quote` is currently logged and dropped
-   (see the ADR) - the scheduler works around this by deriving a working
-   quote from the last closed bar, which is good enough to evaluate the
-   strategy but not to fill an order at a realistic price; a real order
-   attempted through the manual demo endpoint used a stale hardcoded price
-   and was rejected by the broker (`retcode=10016`, "Invalid stops")
-   because the market had since moved.
+2. **`AGENT_DISCONNECTED`/`BROKER_DISCONNECTED` execution guards.** A live
+   quote cache now exists (see above) and backs `PRICE_STALE`; these two
+   other Phase-5-dependent hard gates still aren't derived from the
+   heartbeat's own `terminal_connected`/`trade_allowed`/last-seen fields.
 3. **Add tests for `agent/executor.py`, `watcher.py`, `heartbeat.py`,
    `health.py`, `main.py`** - currently wired but unverified beyond import
    and manual reasoning.
 4. **Rate limiting/backpressure** on the heartbeat and the `event.quote`
-   throttle (SPEC-04 §5's 4/sec max) - not implemented on either side.
+   throttle (SPEC-04 §5's 4/sec max) - not implemented on either side. The
+   manual demo endpoint's hardcoded price levels are also still stale (it
+   predates the live quote cache and was never updated to use it); a real
+   order attempted through it was rejected by the broker (`retcode=10016`,
+   "Invalid stops") because the market had since moved.
 5. **`position_monitor`**: an intra-candle loop for position management
    (breakeven, partials, trailing, time exit) independent of candle
    closes - deferred; today position management only happens as part of

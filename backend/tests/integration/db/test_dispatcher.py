@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.quotes import store_quote
 from app.domain.execution.enums import ExecutionState
 from app.domain.market.enums import AssetClass, Direction, Regime
 from app.domain.market.symbol_spec import SymbolSpec
@@ -362,4 +364,115 @@ async def test_silent_fault_transitions_the_intent_to_unknown(db_session: AsyncS
     assert (
         await TradeIntentRepository(db_session).get_state(result.trade_intent_id)
         == ExecutionState.UNKNOWN
+    )
+
+
+async def test_price_stale_cancels_when_no_cached_quote_exists(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    """PRICE_STALE only fires when a `redis` client is supplied - it's the
+    live quote cache (`app/core/quotes.py`) opt-in, so callers that predate
+    it (every other test in this file) keep working unchanged."""
+    refs = await seed_minimal_refs(db_session)
+    await _enable_trading(db_session, refs.account_id)
+    await db_session.commit()
+    result = await _submit(db_session, refs, reference="SIG-DISP-PRICE-STALE-1")
+
+    broker = SimulatedBroker(spec=_SPEC)
+    dispatcher = OutboxDispatcher(
+        broker=AsyncSimulatedBrokerAdapter(broker),
+        account_repo=AccountRepository(db_session),
+        outbox_repo=OutboxRepository(db_session),
+        intent_repo=TradeIntentRepository(db_session),
+        reconciliation_repo=ReconciliationRepository(db_session),
+        redis=redis_client,
+        quote_stale_seconds=5,
+    )
+    outcomes = await dispatcher.dispatch_pending(
+        account_id=refs.account_id, as_of=datetime.now(UTC)
+    )
+    await db_session.commit()
+
+    assert outcomes[0].sent is False
+    assert outcomes[0].cancelled_reason == "PRICE_STALE"
+    assert broker.get_positions() == ()
+    assert (
+        await TradeIntentRepository(db_session).get_state(result.trade_intent_id)
+        == ExecutionState.CANCELLED
+    )
+
+
+async def test_price_stale_cancels_when_cached_quote_is_too_old(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await _enable_trading(db_session, refs.account_id)
+    await db_session.commit()
+    await _submit(db_session, refs, reference="SIG-DISP-PRICE-STALE-2")
+
+    now = datetime.now(UTC)
+    await store_quote(
+        redis_client,
+        account_id=refs.account_id,
+        symbol="XAUUSD",
+        bid=Decimal("3400.00"),
+        ask=Decimal("3400.25"),
+        server_time=now - timedelta(seconds=30),
+        received_at=now - timedelta(seconds=30),  # older than quote_stale_seconds=5
+    )
+
+    broker = SimulatedBroker(spec=_SPEC)
+    dispatcher = OutboxDispatcher(
+        broker=AsyncSimulatedBrokerAdapter(broker),
+        account_repo=AccountRepository(db_session),
+        outbox_repo=OutboxRepository(db_session),
+        intent_repo=TradeIntentRepository(db_session),
+        reconciliation_repo=ReconciliationRepository(db_session),
+        redis=redis_client,
+        quote_stale_seconds=5,
+    )
+    outcomes = await dispatcher.dispatch_pending(account_id=refs.account_id, as_of=now)
+    await db_session.commit()
+
+    assert outcomes[0].sent is False
+    assert outcomes[0].cancelled_reason == "PRICE_STALE"
+
+
+async def test_fresh_cached_quote_passes_the_price_stale_guard(
+    db_session: AsyncSession, redis_client: Redis
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await _enable_trading(db_session, refs.account_id)
+    await db_session.commit()
+    result = await _submit(db_session, refs, reference="SIG-DISP-PRICE-FRESH")
+
+    now = datetime.now(UTC)
+    await store_quote(
+        redis_client,
+        account_id=refs.account_id,
+        symbol="XAUUSD",
+        bid=Decimal("3400.00"),
+        ask=Decimal("3400.25"),
+        server_time=now,
+        received_at=now,
+    )
+
+    broker = SimulatedBroker(spec=_SPEC)
+    dispatcher = OutboxDispatcher(
+        broker=AsyncSimulatedBrokerAdapter(broker),
+        account_repo=AccountRepository(db_session),
+        outbox_repo=OutboxRepository(db_session),
+        intent_repo=TradeIntentRepository(db_session),
+        reconciliation_repo=ReconciliationRepository(db_session),
+        redis=redis_client,
+        quote_stale_seconds=5,
+    )
+    outcomes = await dispatcher.dispatch_pending(account_id=refs.account_id, as_of=now)
+    await db_session.commit()
+
+    assert outcomes[0].sent is True
+    assert outcomes[0].order_result is not None
+    assert (
+        await TradeIntentRepository(db_session).get_state(result.trade_intent_id)
+        == ExecutionState.SENT
     )

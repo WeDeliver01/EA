@@ -9,22 +9,29 @@ independently testable functions here preserves that even though nothing
 routes between them but a direct call in this MVP (no real message bus - see
 docs/adr/0001-mvp-scope.md).
 
-Execution guard scope: SPEC-06 §5 step 19 lists six fast re-checks. Four are
-implemented here because they're derivable from persisted state alone -
-`KILL_SWITCH_ACTIVE`, `TRADING_DISABLED`, `DAILY_LOSS_LIMIT`,
-`RECONCILIATION_UNRESOLVED`. `AGENT_DISCONNECTED`, `BROKER_DISCONNECTED` and
-price/spread staleness need a live agent heartbeat and quote stream that
-don't exist without Phase 5 - a documented gap, not a silent one.
+Execution guard scope: SPEC-06 §5 step 19 lists six fast re-checks. Five are
+implemented here: `KILL_SWITCH_ACTIVE`, `TRADING_DISABLED`,
+`DAILY_LOSS_LIMIT`, `RECONCILIATION_UNRESOLVED` are derivable from persisted
+state alone; `PRICE_STALE` uses the live quote cache (`app.core.quotes`,
+populated from `event.heartbeat` - see `app.transport.event_router`) and is
+only checked when a `redis` client and `symbol` are supplied, so every
+existing caller that predates the live quote cache keeps working unchanged.
+`AGENT_DISCONNECTED` and `BROKER_DISCONNECTED` still need to be derived from
+the agent heartbeat's own liveness/`trade_allowed` fields - not implemented
+here yet, a documented gap, not a silent one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from redis.asyncio import Redis
+
+from app.core.quotes import get_quote
 from app.domain.execution.enums import ExecutionState, OrderSide, OrderType
 from app.domain.execution.intent import OrderIntent
 from app.execution.broker import AsyncBroker, OrderResult
@@ -81,14 +88,20 @@ class OutboxDispatcher:
         outbox_repo: OutboxRepository,
         intent_repo: TradeIntentRepository,
         reconciliation_repo: ReconciliationRepository,
+        redis: Redis | None = None,
+        quote_stale_seconds: int = 5,
     ) -> None:
         self._broker = broker
         self._account_repo = account_repo
         self._outbox_repo = outbox_repo
         self._intent_repo = intent_repo
         self._reconciliation_repo = reconciliation_repo
+        self._redis = redis
+        self._quote_stale_seconds = quote_stale_seconds
 
-    async def execution_guard(self, account_id: UUID, *, as_of: datetime) -> GuardResult:
+    async def execution_guard(
+        self, account_id: UUID, *, as_of: datetime, symbol: str | None = None
+    ) -> GuardResult:
         risk_state = await self._account_repo.compute_risk_state(account_id, as_of=as_of)
         if risk_state.kill_switch_active:
             return GuardResult(False, "KILL_SWITCH_ACTIVE")
@@ -106,6 +119,13 @@ class OutboxDispatcher:
 
         if await self._reconciliation_repo.has_unresolved_critical(account_id):
             return GuardResult(False, "RECONCILIATION_UNRESOLVED")
+
+        if symbol is not None and self._redis is not None:
+            quote = await get_quote(self._redis, account_id=account_id, symbol=symbol)
+            if quote is None or (as_of - quote.received_at) >= timedelta(
+                seconds=self._quote_stale_seconds
+            ):
+                return GuardResult(False, "PRICE_STALE")
 
         return GuardResult(True, None)
 
@@ -127,7 +147,9 @@ class OutboxDispatcher:
     ) -> DispatchOutcome:
         trade_intent_id = UUID(str(row.payload["trade_intent_id"]))
 
-        guard = await self.execution_guard(account_id, as_of=as_of)
+        guard = await self.execution_guard(
+            account_id, as_of=as_of, symbol=row.payload.get("symbol")
+        )
         if not guard.passed:
             await self._outbox_repo.mark_dispatched(row.id, dispatched_at=as_of)
             await self._intent_repo.transition(
