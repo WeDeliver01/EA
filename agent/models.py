@@ -151,3 +151,20 @@ class TerminalHealth:
     algo_trading_enabled: bool
     build: int
     broker_time: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class BarSnapshot:
+    """`event.get_bars_result` payload row, mirrors backend `app.domain.market.Bar`
+    field-for-field - `open_time` is always the bar's OPEN, in true UTC."""
+
+    symbol: str
+    timeframe: str
+    open_time: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    tick_volume: int
+    real_volume: int | None
+    spread_points: int | None

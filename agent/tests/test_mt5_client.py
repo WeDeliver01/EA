@@ -13,9 +13,11 @@ from agent.mt5_client import (
     LOCAL_NOT_CONNECTED,
     LOCAL_UNSUPPORTED_ORDER_TYPE,
     MT5Client,
+    MT5Error,
 )
 from agent.tests.fake_mt5 import (
     FakeMT5,
+    make_bar,
     make_deal,
     make_order_result,
     make_position,
@@ -308,3 +310,95 @@ class TestGetDeals:
         # +1h broker offset is subtracted back out, is 5 minutes after the
         # frozen agent "now" in true UTC.
         assert deals[0].executed_at == frozen_now + timedelta(minutes=5)
+
+
+class TestGetBars:
+    async def test_requires_from_or_count(self, client: MT5Client) -> None:
+        with pytest.raises(ValueError, match="from_ or count"):
+            await client.get_bars("XAUUSD", "M15")
+
+    async def test_count_uses_from_pos_starting_at_1(
+        self, fake: FakeMT5, client: MT5Client
+    ) -> None:
+        """Position 0 is the still-forming bar - SPEC-01's Bar convention
+        says the strategy engine must never see one, so `count` always
+        starts the fetch at position 1."""
+        fake.symbols["XAUUSD"] = make_symbol()
+        fake.rates = [make_bar()]
+
+        await client.get_bars("XAUUSD", "M15", count=50)
+
+        kind, symbol, timeframe, start_pos, count = fake.copy_rates_calls[0]
+        assert kind == "from_pos"
+        assert symbol == "XAUUSD"
+        assert timeframe == 15  # _TIMEFRAME_TO_MT5["M15"]
+        assert start_pos == 1
+        assert count == 50
+
+    async def test_range_bounds_are_naive_broker_time(
+        self, fake: FakeMT5, client: MT5Client, frozen_now: datetime
+    ) -> None:
+        fake.symbols["XAUUSD"] = make_symbol()
+        broker_now = frozen_now + timedelta(hours=1)
+        fake.ticks["XAUUSD"] = make_tick(time=int(broker_now.timestamp()))
+        fake.rates = [make_bar()]
+
+        from_ = datetime(2023, 11, 14, 12, 0, 0, tzinfo=UTC)
+        await client.get_bars("XAUUSD", "M15", from_=from_)
+
+        kind, _symbol, _tf, date_from, date_to = fake.copy_rates_calls[0]
+        assert kind == "range"
+        assert date_from.tzinfo is None
+        assert date_to.tzinfo is None
+        assert date_from.hour == 13  # from_ (12:00) shifted by the +1h broker offset
+
+    async def test_open_time_is_converted_back_to_utc(
+        self, fake: FakeMT5, client: MT5Client, frozen_now: datetime
+    ) -> None:
+        fake.symbols["XAUUSD"] = make_symbol()
+        broker_now = frozen_now + timedelta(hours=1)
+        fake.ticks["XAUUSD"] = make_tick(time=int(broker_now.timestamp()))
+
+        bar_broker_open = frozen_now + timedelta(hours=1, minutes=15)
+        fake.rates = [make_bar(time=int(bar_broker_open.timestamp()))]
+
+        bars = await client.get_bars("XAUUSD", "M15", count=1)
+
+        assert bars[0].open_time == frozen_now + timedelta(minutes=15)
+        assert bars[0].symbol == "XAUUSD"
+        assert bars[0].timeframe == "M15"
+
+    async def test_maps_ohlcv_and_zero_real_volume_is_none(
+        self, fake: FakeMT5, client: MT5Client
+    ) -> None:
+        fake.symbols["XAUUSD"] = make_symbol()
+        fake.rates = [
+            make_bar(
+                open=3410.5,
+                high=3415.2,
+                low=3408.1,
+                close=3412.75,
+                tick_volume=340,
+                spread=3,
+                real_volume=0,
+            )
+        ]
+
+        bars = await client.get_bars("XAUUSD", "M15", count=1)
+
+        bar = bars[0]
+        assert bar.open == Decimal("3410.5")
+        assert bar.high == Decimal("3415.2")
+        assert bar.low == Decimal("3408.1")
+        assert bar.close == Decimal("3412.75")
+        assert bar.tick_volume == 340
+        assert bar.spread_points == 3
+        assert bar.real_volume is None
+
+    async def test_none_rates_raises(self, fake: FakeMT5, client: MT5Client) -> None:
+        fake.symbols["XAUUSD"] = make_symbol()
+        fake.rates = None
+        fake.last_error_value = (1, "no history")
+
+        with pytest.raises(MT5Error, match="no history"):
+            await client.get_bars("XAUUSD", "M15", count=10)

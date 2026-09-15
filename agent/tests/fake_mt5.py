@@ -49,6 +49,8 @@ class FakeMT5:
         self.order_send_result: Any = None
         self.order_send_calls: list[dict] = []
         self.history_deals: list[SimpleNamespace] = []
+        self.rates: list[dict] | None = []
+        self.copy_rates_calls: list[tuple[Any, ...]] = []
         self.last_error_value = (0, "no error")
 
     # -- terminal / account -----------------------------------------------------
@@ -100,6 +102,16 @@ class FakeMT5:
         if position is not None:
             return tuple(d for d in self.history_deals if d.position_id == position)
         return tuple(self.history_deals)
+
+    # -- rates ---------------------------------------------------------------
+
+    def copy_rates_range(self, symbol: str, timeframe: int, date_from: Any, date_to: Any) -> Any:
+        self.copy_rates_calls.append(("range", symbol, timeframe, date_from, date_to))
+        return self.rates
+
+    def copy_rates_from_pos(self, symbol: str, timeframe: int, start_pos: int, count: int) -> Any:
+        self.copy_rates_calls.append(("from_pos", symbol, timeframe, start_pos, count))
+        return self.rates
 
 
 def make_symbol(
@@ -217,3 +229,30 @@ def make_deal(
         profit=profit,
         time=time,
     )
+
+
+def make_bar(
+    *,
+    time: int = 1_700_000_000,
+    open: float = 100.0,
+    high: float = 100.5,
+    low: float = 99.5,
+    close: float = 100.2,
+    tick_volume: int = 120,
+    spread: int = 2,
+    real_volume: int = 0,
+) -> dict:
+    """The real `copy_rates_*` functions return a numpy structured array,
+    whose rows support `row["field"]` access but not `row.field` - a plain
+    `dict` gives `mt5_client.py`'s `_sync_get_bars` the same interface
+    without pulling numpy into this fake."""
+    return {
+        "time": time,
+        "open": open,
+        "high": high,
+        "low": low,
+        "close": close,
+        "tick_volume": tick_volume,
+        "spread": spread,
+        "real_volume": real_volume,
+    }

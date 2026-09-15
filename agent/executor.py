@@ -110,5 +110,17 @@ class CommandExecutor:
         spec = await self._mt5.get_symbol_spec(payload["symbol"])
         return _fill_result_dict(spec)
 
+    async def _handle_get_bars(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from_ = datetime.fromisoformat(payload["from"]) if payload.get("from") else None
+        to = datetime.fromisoformat(payload["to"]) if payload.get("to") else None
+        bars = await self._mt5.get_bars(
+            payload["symbol"],
+            payload["timeframe"],
+            from_=from_,
+            to=to,
+            count=payload.get("count"),
+        )
+        return {"bars": [_fill_result_dict(b) for b in bars]}
+
     async def _handle_ping(self, _payload: dict[str, Any]) -> dict[str, Any]:
         return {"pong": True}

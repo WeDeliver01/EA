@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - MetaTrader5 is Windows-only
 
 from agent.models import (
     AccountSnapshot,
+    BarSnapshot,
     BrokerPositionSnapshot,
     DealType,
     Fill,
@@ -63,6 +64,22 @@ _MT5_DEAL_TYPE_BUY = 0
 _MT5_DEAL_TYPE_SELL = 1
 _MT5_POSITION_TYPE_BUY = 0
 _MT5_POSITION_TYPE_SELL = 1
+
+# MQL5 ENUM_TIMEFRAMES values - stable per the API, mirrored in fake_mt5.py.
+# Only the timeframes `app.domain.market.enums.Timeframe` defines are mapped;
+# an unmapped string (e.g. "M1" isn't in the enum but is in MT5's own set) is
+# a caller bug, not a broker condition, so `get_bars` raises `KeyError` on one
+# rather than silently falling back to something else.
+_TIMEFRAME_TO_MT5 = {
+    "M1": 1,
+    "M5": 5,
+    "M15": 15,
+    "M30": 30,
+    "H1": 16385,
+    "H4": 16388,
+    "D1": 16408,
+    "W1": 16409,
+}
 
 _SIDE_TO_MT5 = {OrderSide.BUY: _MT5_ORDER_TYPE_BUY, OrderSide.SELL: _MT5_ORDER_TYPE_SELL}
 _MT5_DEAL_SIDE = {_MT5_DEAL_TYPE_BUY: OrderSide.BUY, _MT5_DEAL_TYPE_SELL: OrderSide.SELL}
@@ -157,6 +174,27 @@ class MT5Client:
     async def get_deals(self, *, since: datetime | None = None) -> tuple[Fill, ...]:
         async with self._lock:
             return await self._run(self._sync_get_deals, since)
+
+    async def get_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        from_: datetime | None = None,
+        to: datetime | None = None,
+        count: int | None = None,
+    ) -> tuple[BarSnapshot, ...]:
+        """SPEC-04 §4 `command.get_bars`. Either `from_` (with an optional
+        `to`, defaulting to now) or `count` must be given: `from_`/`to` maps
+        to `copy_rates_range` (a bounded historical window), `count` to
+        `copy_rates_from_pos` (the most recent N *closed* bars, counting
+        back from position 1 - position 0 is the still-forming current bar,
+        which SPEC-01's Bar convention says the strategy engine must never
+        see)."""
+        if from_ is None and count is None:
+            raise ValueError("get_bars requires either from_ or count")
+        async with self._lock:
+            return await self._run(self._sync_get_bars, symbol, timeframe, from_, to, count)
 
     # -- executor plumbing ----------------------------------------------------
 
@@ -571,3 +609,50 @@ class MT5Client:
                 )
             )
         return tuple(out)
+
+    def _sync_get_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        from_: datetime | None,
+        to: datetime | None,
+        count: int | None,
+    ) -> tuple[BarSnapshot, ...]:
+        self._select_symbol(symbol)
+        mt5_timeframe = _TIMEFRAME_TO_MT5[timeframe]
+        # `copy_rates_range`'s bounds are naive broker-server time, not UTC -
+        # the same quirk `_sync_get_deals` already works around (see
+        # `_broker_offset`).
+        offset = self._broker_offset()
+
+        if from_ is not None:
+            to_utc = to or datetime.now(tz=UTC)
+            date_from = (from_ + offset).replace(tzinfo=None)
+            date_to = (to_utc + offset).replace(tzinfo=None)
+            rates = mt5.copy_rates_range(symbol, mt5_timeframe, date_from, date_to)
+        else:
+            # Position 0 is the still-forming, not-yet-closed bar; starting
+            # at position 1 guarantees only closed bars come back, per
+            # SPEC-01's Bar convention that the strategy engine never sees a
+            # forming bar.
+            rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 1, count)
+
+        if rates is None:
+            code, desc = mt5.last_error()
+            raise MT5Error(f"mt5.copy_rates_*({symbol!r}, {timeframe!r}) failed: [{code}] {desc}")
+
+        return tuple(
+            BarSnapshot(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=datetime.fromtimestamp(int(row["time"]), tz=UTC) - offset,
+                open=Decimal(str(row["open"])),
+                high=Decimal(str(row["high"])),
+                low=Decimal(str(row["low"])),
+                close=Decimal(str(row["close"])),
+                tick_volume=int(row["tick_volume"]),
+                real_volume=int(row["real_volume"]) or None,
+                spread_points=int(row["spread"]),
+            )
+            for row in rates
+        )
