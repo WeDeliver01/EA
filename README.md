@@ -78,10 +78,15 @@ There's also now a real, authenticated REST API (`app/api/v1/`) for
 everything the operator would want to *see*: `/auth/*` (JWT login,
 refresh rotation, logout), `/accounts`, `/analysis-runs` (the decision
 journal, WAIT included), `/signals`, `/positions`, `/trades`, and
-`/telemetry/gate-rejections` ("why has the bot not traded"). This is the
-read half of `SPEC-09`'s Next.js terminal's API - the terminal itself,
-and every control endpoint (kill switch, close positions), are still
-unbuilt.
+`/telemetry/gate-rejections` ("why has the bot not traded"). And now
+there's a browser for it: `frontend/` is a real Next.js terminal (login,
+dashboard, decision feed with WAIT included, decision detail with
+narrative/evidence/gates, positions, trades) built against `SPEC-09`'s
+design system and deployed as a fourth service in the same
+`docker-compose.yml` as the backend. Every control endpoint (kill
+switch, close positions), the candle chart, replay-diff, and the
+WebSocket real-time layer are still unbuilt - see the ADR's Phase 8
+section for exactly what's covered and what isn't.
 **What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is not
 implemented on either side; `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED`
 (the other two Phase-5-dependent hard gates) aren't wired up yet even
@@ -99,7 +104,7 @@ full breakdown).
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
 | 5 MT5 bridge | 🟡 Connected, trading and managing positions autonomously - reconnection replay still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
-| 7 Terminal | 🟡 Read-only API built (auth, decision journal, positions, trades, telemetry) - the Next.js UI and all controls still missing - see ADR |
+| 7 Terminal | 🟡 Read-only API and Next.js UI built (auth, decision journal, positions, trades, telemetry) - charts, WebSocket real-time, and all controls still missing - see ADR |
 | 8 Demo, then live | Not started |
 
 ## Repository layout
@@ -130,7 +135,11 @@ agent/            MT5 execution agent (SPEC-04 §8), Python 3.12, standalone pac
                    transport.py/executor.py/watcher.py/heartbeat.py/health.py/main.py:
                    scaffolded and wired, not yet connected to a real backend - see the ADR.
                    Ships independently of backend/ - Windows-only, never imports app.*.
-ea/, frontend/, infra/nginx/, infra/prometheus/, docs/runbooks/
+frontend/         Next.js 16 terminal (SPEC-09): login, dashboard, decision feed,
+                   decision detail, positions, trades. TanStack Query polling stands in
+                   for the WebSocket layer. Dockerfile + docker-compose service built;
+                   charts, controls, and remaining routes not yet - see the ADR.
+ea/, infra/nginx/, infra/prometheus/, docs/runbooks/
                    Stubbed per docs/specs/SPEC-00 §5. Not implemented - see the ADR.
 docs/specs/        The full spec set this was built from.
 docs/adr/          Architecture decision records.
@@ -153,10 +162,17 @@ curl localhost:8000/api/v1/system/ready
 Or, with Docker:
 
 ```bash
-make up      # builds and starts postgres, redis, migrate, api
+make up      # builds and starts postgres, redis, migrate, api, frontend
 curl localhost:8000/api/v1/system/ready
+open http://localhost:3000   # the Next.js terminal
 make down
 ```
+
+The frontend needs `FRONTEND_API_BASE_URL` in `.env` (the URL it should
+call the API at, baked in at build time - defaults to
+`http://localhost:8000/api/v1`) and, if that's not `localhost`, a
+matching `CORS_ORIGINS` entry on the backend so the browser is actually
+allowed to call it.
 
 ## Verifying it
 

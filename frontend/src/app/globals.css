@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+/* SPEC-09 §2: dark, neutral, high information density - one fixed palette,
+   not a light/dark toggle. Colour carries one meaning only: direction and
+   P/L. Nothing else is coloured. */
+:root {
+  --background: #0b0d0f;
+  --surface: #14171a;
+  --surface-raised: #1c2025;
+  --border: #262b31;
+  --text-primary: #e8eaed;
+  --text-secondary: #8b9299;
+  --text-muted: #5a6169;
+
+  --long: #16a34a;
+  --short: #dc2626;
+  --warning: #f4c430;
+  --accent: #3b82f6;
+  --off: #5a6169;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-long: var(--long);
+  --color-short: var(--short);
+  --color-warning: var(--warning);
+  --color-accent: var(--accent);
+  --color-off: var(--off);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--text-primary);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Prices, volumes and R multiples align on the decimal, always - tabular
+   figures are non-negotiable in a trading interface (SPEC-09 §2). */
+.tabular {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}

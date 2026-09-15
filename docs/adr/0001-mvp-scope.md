@@ -923,6 +923,79 @@ pass given what they can do); `/strategy`, `/research`, `/risk`,
 in front of any of this (the VPS's `api` service is still bound
 `0.0.0.0:8000` directly - see "Phase 5 / connecting the two halves").
 
+### Phase 8 / the Next.js portal terminal
+
+The read API from Phase 7 had nothing rendering it. The operator asked
+for a full Next.js frontend (not a lightweight page bundled into the
+backend, not an SSH-tunnel-only tool - reachable directly from a
+browser), deployed as a new service in the same VPS `docker-compose.yml`
+rather than a separate hosting target, with a custom domain to follow
+later. `frontend/` is that build, scaffolded with `create-next-app`
+(React 19, Tailwind v4; the spec says "Next.js 15", the installed
+`create-next-app@latest` resolved to 16.3.5 - same direction, noted here
+rather than pinned back).
+
+- **Design tokens** (`SPEC-09` §2) implemented verbatim as CSS custom
+  properties in `globals.css` and mapped through Tailwind v4's `@theme
+  inline` - background/surface/border/text triads and the five
+  single-meaning accent colours (long/short/warning/neutral/off).
+  Colour carries direction and P/L only, nothing else, per the spec's
+  own rule.
+- **Auth** (`src/lib/auth.ts`, `src/lib/api.ts`): JWT access/refresh
+  tokens in `localStorage`, not httpOnly cookies - a deliberate
+  single-operator tradeoff, not the default a multi-tenant product would
+  need. `apiFetch` retries a 401 once through a single in-flight refresh
+  (`refreshOnce`), so several queries expiring together share one
+  rotation instead of racing to invalidate each other's refresh token.
+  `AuthGuard` redirects to `/login` client-side; there is no
+  server-side session check, consistent with "the terminal must not be
+  required for the system to trade safely" (`SPEC-09` §8).
+- **Five routes built**: `/` (dashboard: account summary, open
+  positions, latest decisions, 7-day gate telemetry), `/signals` (the
+  decision feed, WAIT included, filterable by outcome), `/analysis/[id]`
+  (decision detail: narrative, evidence, gates, the raw `MarketState`
+  snapshot collapsible), `/positions` (open/closed/all, filterable),
+  `/trades` (closed history). All data comes from `useQuery` against
+  Phase 7's read API with a 5s `refetchInterval` standing in for
+  `SPEC-09` §6's WebSocket layer - polling, not a second source of
+  truth: every number rendered is exactly what the endpoint returned,
+  computed nowhere client-side, per §8's "the backend is the single
+  source of truth."
+- **Not built**: the candle chart and replay-diff in the decision detail
+  view (both need endpoints Phase 7 didn't build - `/market/bars` and a
+  replay endpoint); the WebSocket real-time layer (§6) and its Zustand
+  quote/P&L store; every control action (§7 - kill switch, close-all,
+  breakeven/partial/close on a position, all TOTP-gated) and the
+  `/strategy`, `/research`, `/risk`, `/audit`, `/settings` routes, none
+  of which have a backing endpoint yet either.
+- **Deployment**: `frontend/Dockerfile` is a three-stage build
+  (`deps`/`builder`/`runner`) against `next.config.ts`'s `output:
+  "standalone"`, producing a minimal runtime image (`node server.js`,
+  no full `node_modules` or source tree). `NEXT_PUBLIC_API_BASE_URL` is
+  a build arg, not a runtime env var - Next.js inlines
+  `NEXT_PUBLIC_*` values into the client bundle at build time, so it has
+  to be known before `npm run build` runs, not after. `infra/
+  docker-compose.yml` gained a `frontend` service (port `3000`,
+  `depends_on: api: condition: service_healthy`, the build arg sourced
+  from a new `FRONTEND_API_BASE_URL` `.env` variable) rather than a
+  separate compose file, per the operator's "same VPS" instruction.
+  Reaching it from a browser before the domain exists means pointing
+  `FRONTEND_API_BASE_URL` at the VPS's public IP and adding that same
+  origin to the backend's `CORS_ORIGINS` - both manual `.env` steps the
+  operator does at actual deploy time, not something this build could
+  bake in without knowing the VPS's address. TLS/nginx/the domain itself
+  are still deferred, same as Phase 7 left `api` bound directly.
+- Verified by building for production (`next build` - a clean
+  TypeScript pass), assembling and running the exact standalone runtime
+  artifact the Docker image produces, and driving every route through a
+  real backend and a seeded Postgres database with Playwright
+  (login, all five pages, the WAIT/TRADE filters on both `/signals` and
+  `/positions`, navigation into `/analysis/[id]` for both outcomes) -
+  zero browser console errors. One real bug this pass caught and fixed:
+  the `/trades` and `/positions` tables had no horizontal padding
+  between adjacent cells, which visually merged narrow columns (`R` and
+  `Exit reason`) into unreadable text under real data.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
@@ -936,16 +1009,21 @@ don't, and reconnection replay itself is still unbuilt); the MQL5 `ea/`
 fallback; the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
 metrics, the nightly determinism replay job - a `position_monitor` loop
 for intra-candle position management now exists, see "Phase 5 / the
-position monitor"); the Next.js `frontend/` terminal itself, the
-trading-control endpoints, and TOTP (the read half of its API now
-exists - see "Phase 7 / the portal read API (partial)"; any HTML/PDF
-rendering of the research report is still unbuilt regardless); and the
-demo/live measurement phases. `infra/` has a working dev
-`docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
-production compose file; the scheduler runs inside the existing `api`
-service rather than a separate one (see above), so there is still
-nothing else running in `workers/` as its own process to put behind a
-production compose file.
+position monitor"); the trading-control endpoints, and TOTP (the read
+half of its API now exists - see "Phase 7 / the portal read API
+(partial)"; any HTML/PDF rendering of the research report is still
+unbuilt regardless); and the demo/live measurement phases. The Next.js
+`frontend/` terminal now exists for the read-only surface (five routes -
+see "Phase 8 / the Next.js portal terminal") but not its candle chart,
+replay diff, WebSocket real-time layer, or any control action, all of
+which wait on backend endpoints this pass didn't build either.
+`infra/` has a working dev `docker-compose.yml` (now including the
+frontend as a fourth built service) and a stub `nginx/`/`prometheus/`
+layout but no production compose file, and no TLS/domain in front of
+either the API or the frontend yet; the scheduler runs inside the
+existing `api` service rather than a separate one (see above), so there
+is still nothing else running in `workers/` as its own process to put
+behind a production compose file.
 
 ## Consequences
 
@@ -981,10 +1059,12 @@ production compose file.
 - The operator can now authenticate as a real user and read back the
   entire trading history through a real API - the decision journal (WAIT
   included), signals, open and closed positions, closed trades, and gate
-  telemetry - all previously only inspectable via `psql` on the VPS. The
-  Next.js terminal that will actually render this for a browser isn't
-  built yet, and neither is anything that lets that operator *act*
-  (kill switch, close positions) - this pass is read-only, deliberately.
+  telemetry - all previously only inspectable via `psql` on the VPS.
+  The Next.js terminal now renders all of it in a browser (dashboard,
+  decision feed, decision detail, positions, trades), deployable
+  alongside the backend in the same `docker-compose.yml`. Nothing lets
+  the operator *act* yet (kill switch, close positions) - both this
+  pass and Phase 7 before it are read-only, deliberately.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and
