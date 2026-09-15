@@ -9,6 +9,7 @@ import os
 from collections.abc import AsyncIterator
 
 import pytest_asyncio
+from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -17,9 +18,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.core.redis import make_redis_client
+
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql+asyncpg://dt:dt_dev_password@localhost:5432/delicate_trader"
 )
+TEST_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 
 @pytest_asyncio.fixture
@@ -61,3 +65,12 @@ async def db_session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
         if tables:
             quoted = ", ".join(f'"{t}"' for t in tables)
             await conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator[Redis]:
+    client = make_redis_client(TEST_REDIS_URL)
+    await client.flushdb()
+    yield client
+    await client.flushdb()
+    await client.aclose()
