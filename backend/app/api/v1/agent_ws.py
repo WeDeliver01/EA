@@ -153,7 +153,7 @@ async def test_trade(request: Request) -> dict[str, object]:
     """TEMPORARY demo-only end-to-end execution test."""
     from datetime import UTC, datetime
     from decimal import Decimal
-    from uuid import UUID
+    from uuid import UUID, uuid4
 
     from app.domain.execution.enums import ExecutionState
     from app.domain.market.enums import Direction, Regime
@@ -161,6 +161,7 @@ async def test_trade(request: Request) -> dict[str, object]:
     from app.domain.strategy.enums import DecisionOutcome
     from app.execution.dispatcher import OutboxDispatcher
     from app.execution.intent_service import submit_decision
+    from app.models.tables import AnalysisRun, Signal
     from app.repositories.outbox import OutboxRepository
     from app.repositories.reconciliation import ReconciliationRepository
     from app.transport.ws_broker import WSAgentBroker
@@ -224,6 +225,53 @@ async def test_trade(request: Request) -> dict[str, object]:
             engine_duration_ms=0,
         )
 
+        # trade_intents.signal_id is a real FK - a signal has to exist before
+        # submit_decision can reference one, so this demo endpoint creates
+        # the minimal analysis_run -> signal chain itself rather than relying
+        # on a strategy run that has never actually happened for this account.
+        analysis_run = AnalysisRun(
+            id=uuid4(),
+            account_id=account_id,
+            instrument_id=instrument_id,
+            strategy_version_id=strategy_version_id,
+            timeframe="M15",
+            as_of=now,
+            mode="live",
+            regime="EXPANSION",
+            outcome="TRADE",
+            confluence_score=Decimal("100"),
+            confluence_band="TEST",
+            direction="LONG",
+            entry=entry,
+            stop_loss=stop,
+            narrative="TEMPORARY DEMO END-TO-END EXECUTION TEST",
+            engine_duration_ms=0,
+            market_snapshot={},
+            created_at=now,
+        )
+        session.add(analysis_run)
+        await session.flush()
+
+        signal = Signal(
+            id=uuid4(),
+            reference=f"demo-test-trade-{now.isoformat()}",
+            analysis_run_id=analysis_run.id,
+            account_id=account_id,
+            instrument_id=instrument_id,
+            strategy_version_id=strategy_version_id,
+            direction="LONG",
+            setup_kind="DEMO",
+            setup_fingerprint=uuid4().hex,
+            entry=entry,
+            stop_loss=stop,
+            take_profits=[{"level": str(take_profit), "fraction": "1.0", "r_multiple": "1.0"}],
+            confluence_score=Decimal("100"),
+            expires_at=now,
+            created_at=now,
+        )
+        session.add(signal)
+        await session.flush()
+
         outbox_repo = OutboxRepository(session)
         intent_repo = TradeIntentRepository(session)
 
@@ -232,7 +280,7 @@ async def test_trade(request: Request) -> dict[str, object]:
             account_repo=account_repo,
             outbox_repo=outbox_repo,
             intent_repo=intent_repo,
-            signal_id=UUID("00000000-0000-0000-0000-000000000001"),
+            signal_id=signal.id,
             account_id=account_id,
             instrument_id=instrument_id,
             strategy_version_id=strategy_version_id,
