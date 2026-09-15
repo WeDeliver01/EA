@@ -12,12 +12,23 @@ enforces this), and this function's entire job is I/O. It lives in
 `calendar_events` is always empty here, matching `app/research/backtester.py`'s
 own documented gap (see the ADR): no calendar/news ingestion exists
 anywhere in this codebase yet, live or backtested.
+
+`quote` is optional: no live quote cache exists yet (`event.quote` is
+still logged and dropped, per `app/transport/event_router.py`), so by
+default this derives one from the primary timeframe's just-closed bar -
+`bid = close`, `ask = close + spread_points * point` (MT5's own bars are
+bid-based, spread reported separately) - the same "quote from the last
+closed bar" approach `app/research/backtester.py`'s `_build_state()`
+already uses, just with real reported spread instead of a cost-model
+estimate. A caller that does have a fresher live quote (once that cache
+exists) can pass one in directly.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 from app.domain.market.enums import Timeframe
@@ -43,8 +54,8 @@ async def build_market_state(
     symbol: str,
     primary_tf: Timeframe,
     context_timeframes: Sequence[Timeframe],
-    quote: Quote,
     as_of: datetime,
+    quote: Quote | None = None,
     signal_lookback: timedelta = timedelta(days=1),
     lookback_bars: int = _DEFAULT_LOOKBACK_BARS,
 ) -> MarketState:
@@ -59,6 +70,23 @@ async def build_market_state(
         )
         for tf in {primary_tf, *context_timeframes}
     }
+
+    if quote is None:
+        primary_bars = bars.get(primary_tf, ())
+        if not primary_bars:
+            raise ValueError(
+                f"no {primary_tf.value} bars available to derive a quote for {symbol} "
+                f"as of {as_of} - pass one explicitly if this is expected"
+            )
+        latest = primary_bars[-1]
+        spread = Decimal(latest.spread_points or 0) * spec.point
+        quote = Quote(
+            symbol=symbol,
+            bid=latest.close,
+            ask=latest.close + spread,
+            server_time=latest.close_time,
+            received_at=as_of,
+        )
 
     recent_signals = await signal_repo.list_recent(
         account_id, instrument_id, symbol=symbol, since=as_of - signal_lookback

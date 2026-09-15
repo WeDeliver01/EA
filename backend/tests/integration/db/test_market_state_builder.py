@@ -90,3 +90,69 @@ async def test_builds_a_valid_market_state_from_live_data(db_session: AsyncSessi
     assert state.calendar_events == ()
     # Constructing MarketState itself validates the lookahead invariant -
     # reaching this point at all is part of what this test proves.
+
+
+async def test_derives_a_quote_from_the_latest_primary_bar_when_none_given(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    market_data_repo = MarketDataRepository(db_session)
+    as_of = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    latest_bar = Bar(
+        symbol="XAUUSD",
+        timeframe=Timeframe.M15,
+        open_time=as_of - timedelta(minutes=15),
+        open=Decimal("99.50"),
+        high=Decimal("100.50"),
+        low=Decimal("99.00"),
+        close=Decimal("100.00"),
+        tick_volume=100,
+        real_volume=None,
+        spread_points=20,
+    )
+    await market_data_repo.upsert_bars(
+        [latest_bar], instrument_id=refs.instrument_id, source="mt5", ingested_at=as_of
+    )
+    await db_session.commit()
+
+    state = await build_market_state(
+        account_repo=AccountRepository(db_session),
+        market_data_repo=market_data_repo,
+        position_repo=PositionRepository(db_session),
+        signal_repo=SignalRepository(db_session),
+        account_id=refs.account_id,
+        instrument_id=refs.instrument_id,
+        symbol="XAUUSD",
+        primary_tf=Timeframe.M15,
+        context_timeframes=[],
+        as_of=as_of,
+    )
+
+    # point defaults to 0.01 in tests/integration/seed.py's Instrument -
+    # 20 spread_points * 0.01 = 0.20.
+    assert state.quote.bid == Decimal("100.00")
+    assert state.quote.ask == Decimal("100.20")
+    assert state.quote.server_time == latest_bar.close_time
+
+
+async def test_raises_when_no_primary_bars_exist_and_no_quote_given(
+    db_session: AsyncSession,
+) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="no M15 bars available"):
+        await build_market_state(
+            account_repo=AccountRepository(db_session),
+            market_data_repo=MarketDataRepository(db_session),
+            position_repo=PositionRepository(db_session),
+            signal_repo=SignalRepository(db_session),
+            account_id=refs.account_id,
+            instrument_id=refs.instrument_id,
+            symbol="XAUUSD",
+            primary_tf=Timeframe.M15,
+            context_timeframes=[],
+            as_of=datetime.now(UTC),
+        )
