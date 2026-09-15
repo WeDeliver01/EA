@@ -62,13 +62,11 @@ class MarketScanner:
         self,
         *,
         bar_source: AgentBarSource,
-        market_data_repo: MarketDataRepository,
         targets: Sequence[ScanTarget],
         candle_close_grace: timedelta = timedelta(milliseconds=1500),
         fetch_count: int = DEFAULT_FETCH_COUNT,
     ) -> None:
         self._bar_source = bar_source
-        self._market_data_repo = market_data_repo
         self._targets = list(targets)
         self._candle_close_grace = candle_close_grace
         self._fetch_count = fetch_count
@@ -80,7 +78,14 @@ class MarketScanner:
         # - the existing safety net this relies on rather than duplicates.
         self._last_published: dict[tuple[UUID, Timeframe], datetime] = {}
 
-    async def scan_once(self, *, now: datetime) -> list[NewlyClosedBar]:
+    async def scan_once(
+        self, *, market_data_repo: MarketDataRepository, now: datetime
+    ) -> list[NewlyClosedBar]:
+        """`market_data_repo` is a per-call parameter, not a constructor
+        dependency: this scanner is meant to be long-lived (it holds
+        `_last_published` across ticks), but each tick needs its own
+        short-lived session/repo, not one held open for the scanner's
+        whole lifetime."""
         newly_closed: list[NewlyClosedBar] = []
         for target in self._targets:
             for tf in target.timeframes:
@@ -89,7 +94,7 @@ class MarketScanner:
                 if not closed:
                     continue
 
-                await self._market_data_repo.upsert_bars(
+                await market_data_repo.upsert_bars(
                     closed,
                     instrument_id=target.instrument_id,
                     source="mt5",

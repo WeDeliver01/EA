@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from functools import lru_cache
+from uuid import UUID
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,6 +56,17 @@ class Settings(BaseSettings):
     candle_close_grace_ms: int = Field(default=1500)
     execution_lock_ttl_seconds: int = Field(default=60)
     global_trading_enabled: bool = Field(default=False)
+
+    # ---- scheduler (single account/instrument for this MVP - see the ADR)
+    scheduler_account_id: UUID | None = Field(default=None)
+    scheduler_instrument_id: UUID | None = Field(default=None)
+    scheduler_strategy_version_id: UUID | None = Field(default=None)
+    scheduler_symbol: str = Field(default="")
+    scheduler_environment: str = Field(default="demo")
+    scheduler_primary_timeframe: str = Field(default="M15")
+    scheduler_context_timeframes: str = Field(default="H1,H4,D1")
+    scheduler_scan_interval_seconds: float = Field(default=5.0)
+    scheduler_dispatch_interval_seconds: float = Field(default=5.0)
 
     # ---- research
     backtest_snapshot_sample_rate: float = Field(default=0.005)

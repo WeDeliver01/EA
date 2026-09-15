@@ -46,18 +46,9 @@ class _FakeBarSource:
         return self._bars.get(timeframe, ())
 
 
-async def test_a_closed_bar_is_upserted_and_reported_once(db_session: AsyncSession) -> None:
-    refs = await seed_minimal_refs(db_session)
-    await db_session.commit()
-
-    now = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
-    closed_bar = _bar(now - timedelta(minutes=16))  # closes well before `now`, clears the grace
-
-    source = _FakeBarSource({Timeframe.M15: (closed_bar,)})
-    market_data_repo = MarketDataRepository(db_session)
-    scanner = MarketScanner(
+def _scanner(source: _FakeBarSource, refs) -> MarketScanner:
+    return MarketScanner(
         bar_source=source,
-        market_data_repo=market_data_repo,
         targets=[
             ScanTarget(
                 account_id=refs.account_id,
@@ -68,7 +59,19 @@ async def test_a_closed_bar_is_upserted_and_reported_once(db_session: AsyncSessi
         ],
     )
 
-    newly_closed = await scanner.scan_once(now=now)
+
+async def test_a_closed_bar_is_upserted_and_reported_once(db_session: AsyncSession) -> None:
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    now = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    closed_bar = _bar(now - timedelta(minutes=16))  # closes well before `now`, clears the grace
+
+    source = _FakeBarSource({Timeframe.M15: (closed_bar,)})
+    market_data_repo = MarketDataRepository(db_session)
+    scanner = _scanner(source, refs)
+
+    newly_closed = await scanner.scan_once(market_data_repo=market_data_repo, now=now)
     await db_session.commit()
 
     assert len(newly_closed) == 1
@@ -90,20 +93,10 @@ async def test_the_still_forming_bar_is_never_reported(db_session: AsyncSession)
     forming_bar = _bar(now)  # opened exactly at `now` - not closed yet
 
     source = _FakeBarSource({Timeframe.M15: (forming_bar,)})
-    scanner = MarketScanner(
-        bar_source=source,
-        market_data_repo=MarketDataRepository(db_session),
-        targets=[
-            ScanTarget(
-                account_id=refs.account_id,
-                instrument_id=refs.instrument_id,
-                symbol="XAUUSD",
-                timeframes=(Timeframe.M15,),
-            )
-        ],
-    )
+    scanner = _scanner(source, refs)
 
-    assert await scanner.scan_once(now=now) == []
+    result = await scanner.scan_once(market_data_repo=MarketDataRepository(db_session), now=now)
+    assert result == []
 
 
 async def test_a_re_scan_of_the_same_close_is_not_reported_twice(
@@ -116,24 +109,16 @@ async def test_a_re_scan_of_the_same_close_is_not_reported_twice(
     closed_bar = _bar(now - timedelta(minutes=16))
 
     source = _FakeBarSource({Timeframe.M15: (closed_bar,)})
-    scanner = MarketScanner(
-        bar_source=source,
-        market_data_repo=MarketDataRepository(db_session),
-        targets=[
-            ScanTarget(
-                account_id=refs.account_id,
-                instrument_id=refs.instrument_id,
-                symbol="XAUUSD",
-                timeframes=(Timeframe.M15,),
-            )
-        ],
-    )
+    scanner = _scanner(source, refs)
+    market_data_repo = MarketDataRepository(db_session)
 
-    first = await scanner.scan_once(now=now)
+    first = await scanner.scan_once(market_data_repo=market_data_repo, now=now)
     await db_session.commit()
     # A later tick before the next candle closes re-fetches the same
     # window - `count`-based get_bars always includes recently-closed bars.
-    second = await scanner.scan_once(now=now + timedelta(seconds=30))
+    second = await scanner.scan_once(
+        market_data_repo=market_data_repo, now=now + timedelta(seconds=30)
+    )
     await db_session.commit()
 
     assert len(first) == 1
@@ -149,27 +134,16 @@ async def test_a_genuinely_new_close_is_reported(db_session: AsyncSession) -> No
 
     source = _FakeBarSource({Timeframe.M15: (first_bar,)})
     market_data_repo = MarketDataRepository(db_session)
-    scanner = MarketScanner(
-        bar_source=source,
-        market_data_repo=market_data_repo,
-        targets=[
-            ScanTarget(
-                account_id=refs.account_id,
-                instrument_id=refs.instrument_id,
-                symbol="XAUUSD",
-                timeframes=(Timeframe.M15,),
-            )
-        ],
-    )
+    scanner = _scanner(source, refs)
 
-    await scanner.scan_once(now=first_now)
+    await scanner.scan_once(market_data_repo=market_data_repo, now=first_now)
     await db_session.commit()
 
     second_now = first_now + timedelta(minutes=15)
     second_bar = _bar(second_now - timedelta(minutes=16))
     source._bars = {Timeframe.M15: (first_bar, second_bar)}
 
-    second_result = await scanner.scan_once(now=second_now)
+    second_result = await scanner.scan_once(market_data_repo=market_data_repo, now=second_now)
     await db_session.commit()
 
     assert len(second_result) == 1

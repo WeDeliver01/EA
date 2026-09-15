@@ -15,6 +15,7 @@ from app.api.v1.system import router as system_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import make_redis_client
+from app.services.scheduler import Scheduler, SchedulerConfig
 from app.transport.registry import AgentConnectionRegistry
 
 logger = get_logger(service="api")
@@ -34,10 +35,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = make_redis_client(settings.redis_url)
     app.state.agent_registry = AgentConnectionRegistry()
 
-    logger.info("api_startup", git_sha=settings.git_sha, environment=settings.environment)
+    scheduler_config = SchedulerConfig.from_settings(settings)
+    scheduler: Scheduler | None = None
+    if scheduler_config is not None:
+        scheduler = Scheduler(
+            session_factory=app.state.session_factory,
+            redis=app.state.redis,
+            registry=app.state.agent_registry,
+            config=scheduler_config,
+        )
+        scheduler.start()
+    app.state.scheduler = scheduler
+
+    logger.info(
+        "api_startup",
+        git_sha=settings.git_sha,
+        environment=settings.environment,
+        scheduler_enabled=scheduler is not None,
+    )
     try:
         yield
     finally:
+        if scheduler is not None:
+            await scheduler.stop()
         await app.state.redis.aclose()
         await engine.dispose()
         logger.info("api_shutdown")

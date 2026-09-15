@@ -50,9 +50,24 @@ stops" - the order was rejected for a stale stop-loss level, not a
 plumbing failure) was correlated back to the waiting dispatcher
 correctly. See "Phase 5 / connecting the two halves" below for what that
 surfaced and fixed. The platform is now connected to a broker end to end;
-what it still can't do is originate that trade on its own (no scheduler
-calls `dispatch_pending` outside a test) or survive a disconnect (no
-reconnection replay).
+at that point it still couldn't originate a trade on its own or survive
+a disconnect (no reconnection replay).
+
+**Update 3:** the platform now watches the market and trades on its own,
+with no human triggering anything - see "Phase 5 / the autonomous
+scheduler" below. `market_scanner` detects candle closes from live agent
+bars, `strategy_worker` evaluates the strategy engine on each close and
+persists a signal when it says TRADE, `execution_worker` turns that
+signal into a risk-checked intent, and the existing `OutboxDispatcher`/
+`Reconciler` (built in Phase 4, previously only called from tests) are
+now driven by a real scheduler loop running inside the `api` process.
+`GLOBAL_TRADING_ENABLED` now actually gates the dispatch step - decisions
+and intents are still recorded when it's off (per the "every decision is
+recorded" principle), but nothing is sent to the broker until an operator
+turns it on. It still can't survive a disconnect (no reconnection
+replay) and still has no live quote feed (see `event.quote` below), so
+the strategy engine derives its working quote from the last closed bar
+rather than a true live tick.
 
 ### Why this boundary specifically
 
@@ -599,20 +614,116 @@ than a broker-level rejection. That's a fidelity gap in a
 plumbing this phase exists to prove - authenticate, dispatch, execute,
 reply, correlate - is what the `retcode=10016` response demonstrates.
 
+### Phase 5 / the autonomous scheduler
+
+Everything above proved the plumbing works when a human calls
+`/agent/test-trade`. It still needed something to close the loop on its
+own: watch the market, decide, and trade with no human involved. That
+required new pieces on both sides of the existing connection:
+
+- **`agent/mt5_client.py`: `get_bars()`.** The agent could already place
+  orders and stream deal/heartbeat events, but had no way to answer "what
+  are the last N closed candles for this symbol/timeframe" - added
+  alongside a new `BarSnapshot` model and an executor dispatch entry,
+  using the same MQL5 `ENUM_TIMEFRAMES` integer constants and UTC/broker
+  time conversion pattern already established for `get_deals()`.
+- **`app/repositories/market_data.py`: bar persistence, with a real bug
+  fixed along the way.** `get_recent_closed_bars()` originally filtered
+  by `open_time < before`, which is wrong for any context timeframe
+  coarser than the primary one - an H1 bar's `open_time` can be well
+  before `before` while the bar itself is still forming. Fixed to filter
+  on the actual close-time boundary (`open_time <= before -
+  timeframe.seconds`), with a regression test that specifically
+  reproduces the H1-inside-M15 case.
+- **`app/workers/market_scanner.py`: candle-close detection.** Polls the
+  agent for recent bars per configured `ScanTarget`, and emits a
+  `NewlyClosedBar` (onto `stream:bars:closed`, a new Redis Stream) only
+  once per `(account, timeframe)` bar, tracked in-memory per scanner
+  instance - not in `app/engines/` despite "market data engine" being the
+  planned location, because `app.engines` is barred by the import-linter
+  layering contract from importing `app.repositories`/SQLAlchemy/Redis at
+  all (engines must stay pure/domain-only); this and
+  `app/workers/market_state.py`'s `build_market_state()` (assembles a
+  `MarketState` from persisted bars/positions/signals, deriving a `Quote`
+  from the latest closed bar when no live quote is available - there is
+  still no live quote cache, see `event.quote` below) live in
+  `app/workers/` instead.
+- **`app/workers/strategy_worker.py`: evaluate on candle close.**
+  Consumes `stream:bars:closed` (skipping any timeframe that isn't the
+  configured primary one - context timeframes exist only to feed
+  `MarketState`, not to trigger their own evaluation), takes a
+  `lock:analyse:{account}:{symbol}:{tf}` Redis lock to prevent duplicate
+  evaluation, builds the `MarketState`, runs the existing (Phase 2)
+  `StrategyEngine.evaluate()` unchanged, persists an `AnalysisRun` either
+  way, and on a TRADE outcome persists a `Signal` and publishes onto
+  `stream:intents:pending` (a second new Redis Stream) - outside the
+  transaction that committed the signal, so a downstream consumer never
+  sees a stream message for a signal that isn't durably there yet.
+- **`app/services/execution_worker.py` and
+  `app/services/reconciliation_worker.py`: turning a signal into a
+  managed position.** These import `app.execution.intent_service`/
+  `app.execution.reconciliation` directly, which ruled out
+  `app/workers/` as their home: the layering contract treats
+  `execution`/`research`/`workers` as mutually exclusive siblings (none
+  may import either of the others), discovered empirically the same way
+  the engines constraint was. `app/services/` - previously an empty stub
+  matching `SPEC-00`'s own "orchestration, transactions" description -
+  is where both actually belong. `execution_worker` reconstructs a
+  minimal `Decision` from the persisted `Signal`'s fields (a real, and
+  not especially stable, coupling to which fields
+  `submit_decision` currently reads) and calls the existing Phase 4
+  `submit_decision`, producing the same SENT/RISK_BLOCKED outcome a
+  manually-triggered call would. `reconciliation_worker` wraps the
+  existing Phase 4 `Reconciler` in a loop that builds its
+  local-position/pending-intent inputs from the repositories on each
+  tick.
+- **`app/services/scheduler.py`: the piece that actually runs any of
+  this continuously.** Five asyncio tasks (scanner, strategy, execution,
+  dispatch, reconciliation), each independently try/excepted so one
+  loop's failure never kills the others, sharing the one
+  `AgentConnectionRegistry` instance the FastAPI app's `/agent/ws` route
+  already holds on `app.state`. This **has** to run inside the `api`
+  process rather than as its own service: `WSAgentBroker`/
+  `AgentConnectionRegistry` are in-process, single-instance state (the
+  live agent WebSocket connection itself) with no cross-process relay -
+  a separate scheduler service would simply never be able to reach the
+  agent. `SchedulerConfig.from_settings()` returns `None` (scheduler
+  doesn't start at all) unless every one of `SCHEDULER_ACCOUNT_ID`/
+  `SCHEDULER_INSTRUMENT_ID`/`SCHEDULER_STRATEGY_VERSION_ID`/
+  `SCHEDULER_SYMBOL` is set - matching this MVP's single-tenant
+  assumptions elsewhere (one registry entry per account) and defaulting
+  to off, the same "system defaults to not trading" principle
+  `GLOBAL_TRADING_ENABLED`'s own default follows. `GLOBAL_TRADING_ENABLED`
+  itself now actually does something: it gates only the dispatch loop's
+  call into `OutboxDispatcher` - decisions, signals and intents are still
+  recorded regardless of the flag, only the final "send this to the
+  broker" step is withheld while it's off.
+- **No new `docker-compose.yml` service.** Given the in-process
+  constraint above, "wire up the scheduler" meant adding the
+  `SCHEDULER_*` environment variables to `.env.example` (all unset by
+  default, so a fresh deployment stays inert) rather than a new compose
+  service - the existing `api` service now also runs the scheduler
+  whenever those variables are configured.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
-sensitivity) sub-stages; Phase 4's worker/queue infrastructure (a
-scheduler that actually calls `dispatch_pending`/`Reconciler.run`) and the
-two discrepancy kinds and retry logic listed above; Phase 5's reconnection
+sensitivity) sub-stages; the two discrepancy kinds and retry logic listed
+above (a scheduler that calls `dispatch_pending`/`Reconciler.run` now
+exists - see "Phase 5 / the autonomous scheduler"); Phase 5's reconnection
 replay and rate limiting/backpressure, on both the agent and backend
-sides (listed above); the MQL5 `ea/` fallback; the rest of Phase 6
-(kill-switch triggers, alerting, Prometheus metrics, the nightly
-determinism replay job); the Next.js `frontend/` terminal (including any
-HTML/PDF rendering of the research report); and the demo/live measurement
-phases. `infra/` has a working dev `docker-compose.yml` and a stub
-`nginx/`/`prometheus/` layout but no production compose file, since
-there's still nothing running in `workers/` yet to put behind it.
+sides (listed above), and a live quote feed (`event.quote` handling -
+the scheduler derives its working quote from the last closed bar
+instead); the MQL5 `ea/` fallback; the rest of Phase 6 (kill-switch
+triggers, alerting, Prometheus metrics, the nightly determinism replay
+job, a `position_monitor` loop for intra-candle position management);
+the Next.js `frontend/` terminal (including any HTML/PDF rendering of
+the research report); and the demo/live measurement phases. `infra/`
+has a working dev `docker-compose.yml` and a stub `nginx/`/`prometheus/`
+layout but no production compose file; the scheduler runs inside the
+existing `api` service rather than a separate one (see above), so there
+is still nothing else running in `workers/` as its own process to put
+behind a production compose file.
 
 ## Consequences
 
@@ -620,9 +731,17 @@ there's still nothing running in `workers/` yet to put behind it.
   intent to fill to management to close to trade record - against a
   simulated broker and a real Postgres database, with the risk engine
   wired live and every decision it makes reloaded from the database, not
-  trusted from a message. It still cannot place a trade with real money:
-  there is no connection to a broker anywhere in this repository, and
-  `GLOBAL_TRADING_ENABLED` has no effect on anything.
+  trusted from a message.
+- The platform now watches the market and trades on its own: when
+  `SCHEDULER_*` is configured, candle closes detected from live agent
+  bars flow through strategy evaluation, signal creation, risk-checked
+  intent submission and broker dispatch with no human triggering any
+  step. `GLOBAL_TRADING_ENABLED` gates the final dispatch-to-broker step
+  (default off); everything upstream of it (decisions, signals, intents)
+  happens either way, matching "every decision is recorded" even while
+  trading itself is switched off. A fresh deployment with no
+  `SCHEDULER_*`/`GLOBAL_TRADING_ENABLED` configured stays exactly as
+  inert as before this pass - both default to off/unset.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and

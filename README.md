@@ -5,7 +5,7 @@ MT5 executes, PostgreSQL remembers every decision including every decision
 not to trade. Full design in [`docs/specs/`](docs/specs/) - start with
 [`SPEC-00-overview.md`](docs/specs/SPEC-00-overview.md).
 
-## Status: MVP build, Phases 0-4 of 8 done, Phase 5 connected and round-trip proven
+## Status: MVP build, Phases 0-4 of 8 done, Phase 5 connected and trading autonomously
 
 This build covers **Foundation, Domain & persistence, the Strategy engine,
 the Research engine (backtester), and Paper execution** to their full
@@ -16,7 +16,9 @@ to) are now deployed as two separate machines (a Windows host running MT5,
 an Ubuntu VPS running the backend) and connected over a real socket - a
 real `command.place_order` sent from the deployed backend was executed by
 the live agent against the real MT5 terminal, and its broker-level reply
-was correlated back correctly. See
+was correlated back correctly. On top of that connection, the platform now
+runs a scheduler (`app/services/scheduler.py`) that watches the market,
+decides, and trades on its own with no human involved - see
 [`docs/adr/0001-mvp-scope.md`](docs/adr/0001-mvp-scope.md) for exactly what
 that means and every deviation from the spec, and
 [`docs/specs/SPEC-10-build-plan.md`](docs/specs/SPEC-10-build-plan.md) for
@@ -46,13 +48,24 @@ real MT5 terminal, and a genuine broker-level reply (a rejection, in the
 one attempt made so far - see the ADR) was correlated back to the waiting
 caller correctly. `dispatcher.py`/`position_manager.py`/`reconciliation.py`
 use `WSAgentBroker` instead of the simulated one with no code changes
-(that's the whole point of the `AsyncBroker` seam).
-**What doesn't exist yet:** `GLOBAL_TRADING_ENABLED` has no effect on
-anything, and there's no scheduler that calls `dispatch_pending`/
-`Reconciler.run` on its own - both remain test-only (or one-off manual
-endpoint) entry points; nothing has originated a trade on its own timer.
-Reconnection replay (SPEC-04 §7.2-§7.4) is also not implemented on either
-side (see the ADR for the full breakdown).
+(that's the whole point of the `AsyncBroker` seam). On top of that,
+`market_scanner` polls the agent for newly closed candles,
+`strategy_worker` runs the (unchanged) strategy engine on every close and
+persists a signal when it says TRADE, `execution_worker` turns that
+signal into a risk-checked intent, and the existing `OutboxDispatcher`/
+`Reconciler` are now driven by a real scheduler loop instead of only a
+test or a manual endpoint - all five loops running as asyncio tasks
+inside the `api` process (see the ADR for why it can't be a separate
+service). `GLOBAL_TRADING_ENABLED` now actually gates the dispatch step
+(default off); `SCHEDULER_ACCOUNT_ID`/`SCHEDULER_INSTRUMENT_ID`/
+`SCHEDULER_STRATEGY_VERSION_ID`/`SCHEDULER_SYMBOL` (all unset by default)
+gate the scheduler starting at all.
+**What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is
+not implemented on either side; there is no live quote feed, so the
+scheduler derives its working quote from the last closed bar rather than
+a true live tick (see the ADR's `event.quote` discussion); and
+`position_monitor` (intra-candle position management on its own timer)
+is still deferred (see the ADR for the full breakdown).
 
 | Phase | Status |
 |---|---|
@@ -61,7 +74,7 @@ side (see the ADR for the full breakdown).
 | 2 Strategy engine | ✅ Done |
 | 3 Research engine | ✅ Done (synthetic data only - see ADR) |
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
-| 5 MT5 bridge | 🟡 Connected, round trip proven - scheduler and reconnection replay still missing - see ADR |
+| 5 MT5 bridge | 🟡 Connected, trading autonomously - reconnection replay and a live quote feed still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
 | 7 Terminal | Not started |
 | 8 Demo, then live | Not started |
@@ -174,32 +187,33 @@ Per `SPEC-10`, the current build increment is **Phase 5 (the MT5 bridge)**.
 Both halves are now deployed as two separate machines and connected -
 `agent/mt5_client.py` live-verified against an FTMO-Demo account,
 `app/transport/` deployed on an Ubuntu VPS and handshaking with the real
-agent over a real socket, and a real `command.place_order`/reply round
-trip has been observed end to end (see the ADR). What's left to finish
-Phase 5:
+agent over a real socket, a real `command.place_order`/reply round trip
+has been observed end to end, and a scheduler now runs the whole
+detect-decide-execute-reconcile loop continuously with no human involved
+(see the ADR). What's left to finish Phase 5:
 
-1. **Build a scheduler** that calls `OutboxDispatcher.dispatch_pending`
-   and `Reconciler.run` on an interval now that an agent is actually
-   connected - neither has ever been called outside a test or the one-off
-   `/agent/test-trade` endpoint; this is a pre-existing gap from Phase 4,
-   not new, but it's what turns "a signal was approved" into "an order was
-   actually sent" without a human hitting an endpoint by hand.
-2. **Implement reconnection replay** (SPEC-04 §7.2-§7.4) on both sides: on
+1. **Implement reconnection replay** (SPEC-04 §7.2-§7.4) on both sides: on
    reconnect, replay the local event queue from the last acked `event_id`,
    then send a full position snapshot and a deal batch covering the
    disconnected window with 5-minute overlap. `agent/store.py` has the
    primitives (`unacked_events`/`ack_event`); nothing calls them yet.
+2. **A live quote source.** `event.quote` is currently logged and dropped
+   (see the ADR) - the scheduler works around this by deriving a working
+   quote from the last closed bar, which is good enough to evaluate the
+   strategy but not to fill an order at a realistic price; a real order
+   attempted through the manual demo endpoint used a stale hardcoded price
+   and was rejected by the broker (`retcode=10016`, "Invalid stops")
+   because the market had since moved.
 3. **Add tests for `agent/executor.py`, `watcher.py`, `heartbeat.py`,
    `health.py`, `main.py`** - currently wired but unverified beyond import
    and manual reasoning.
 4. **Rate limiting/backpressure** on the heartbeat and the `event.quote`
    throttle (SPEC-04 §5's 4/sec max) - not implemented on either side.
-5. **A live quote source**, so a real order can actually fill rather than
-   being rejected for a stale stop-loss level - `event.quote` is currently
-   logged and dropped (see the ADR); the one real order attempted so far
-   used a hardcoded price from whenever the demo endpoint was written and
-   was rejected by the broker (`retcode=10016`, "Invalid stops") because
-   the market has since moved.
+5. **`position_monitor`**: an intra-candle loop for position management
+   (breakeven, partials, trailing, time exit) independent of candle
+   closes - deferred; today position management only happens as part of
+   the synchronous `event.deal`/`event.heartbeat` handling already in
+   `app/transport/event_router.py`.
 6. **Harden the deployment**: the VPS's `api` service is bound to
    `0.0.0.0:8000` (reachable from anywhere, not just the agent's IP) to get
    connected quickly - this needs a firewall rule scoped to the agent's IP
