@@ -10,7 +10,7 @@ never touches (see `app/research/` for those).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select
@@ -85,17 +85,23 @@ class MarketDataRepository:
         before: datetime,
         limit: int,
     ) -> tuple[Bar, ...]:
-        """The most recent `limit` bars with `open_time < before`, oldest
-        first - the exact ordering `MarketState.__post_init__` requires and
-        the exact lookahead boundary it enforces (`before` is normally the
-        primary timeframe's own `as_of`, so this never has to be told
-        separately not to return the still-forming bar)."""
+        """The most recent `limit` bars whose CLOSE time is `<= before`,
+        oldest first - the exact ordering `MarketState.__post_init__`
+        requires and the exact lookahead boundary it enforces (`before` is
+        normally the primary timeframe's own `as_of`).
+
+        Filtering on `open_time` alone would be wrong for any timeframe
+        coarser than the primary one: an H1 bar that opened 10 minutes
+        before an M15 `as_of` has `open_time < before` but doesn't close
+        for another 50 minutes - `close_time = open_time + timeframe.seconds`
+        is the actual boundary `Bar`'s own docstring defines "closed" by."""
+        close_cutoff = before - timedelta(seconds=timeframe.seconds)
         result = await self._session.execute(
             select(MarketBar)
             .where(
                 MarketBar.instrument_id == instrument_id,
                 MarketBar.timeframe == timeframe.value,
-                MarketBar.open_time < before,
+                MarketBar.open_time <= close_cutoff,
             )
             .order_by(MarketBar.open_time.desc())
             .limit(limit)

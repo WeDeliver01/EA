@@ -19,10 +19,15 @@ from tests.integration.seed import seed_minimal_refs
 pytestmark = pytest.mark.integration
 
 
-def _bar(open_time: datetime, *, close: Decimal = Decimal("100.00")) -> Bar:
+def _bar(
+    open_time: datetime,
+    *,
+    close: Decimal = Decimal("100.00"),
+    timeframe: Timeframe = Timeframe.M15,
+) -> Bar:
     return Bar(
         symbol="XAUUSD",
-        timeframe=Timeframe.M15,
+        timeframe=timeframe,
         open_time=open_time,
         open=Decimal("99.50"),
         high=Decimal("100.50"),
@@ -121,6 +126,40 @@ async def test_before_boundary_excludes_the_still_forming_bar(
 
     assert len(read_back) == 1
     assert read_back[0].open_time == closed_bar_open
+
+
+async def test_boundary_uses_close_time_not_open_time_for_coarser_timeframes(
+    db_session: AsyncSession,
+) -> None:
+    """An H1 bar that opened only 10 minutes before an M15 `as_of` has
+    `open_time < as_of` but is nowhere near closed - filtering on open_time
+    alone would leak a forming bar into MarketState for any context
+    timeframe coarser than the primary one."""
+    refs = await seed_minimal_refs(db_session)
+    await db_session.commit()
+
+    repo = MarketDataRepository(db_session)
+    as_of = datetime(2026, 1, 1, 1, 10, tzinfo=UTC)  # 01:10
+    still_forming_h1_open = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)  # opened 01:00, closes 02:00
+    already_closed_h1_open = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)  # opened 00:00, closed 01:00
+
+    await repo.upsert_bars(
+        [
+            _bar(still_forming_h1_open, timeframe=Timeframe.H1),
+            _bar(already_closed_h1_open, timeframe=Timeframe.H1),
+        ],
+        instrument_id=refs.instrument_id,
+        source="mt5",
+        ingested_at=as_of,
+    )
+    await db_session.commit()
+
+    read_back = await repo.get_recent_closed_bars(
+        refs.instrument_id, Timeframe.H1, symbol="XAUUSD", before=as_of, limit=10
+    )
+
+    assert len(read_back) == 1
+    assert read_back[0].open_time == already_closed_h1_open
 
 
 async def test_empty_bars_is_a_noop(db_session: AsyncSession) -> None:
