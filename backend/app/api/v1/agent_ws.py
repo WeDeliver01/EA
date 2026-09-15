@@ -59,7 +59,7 @@ async def _authenticate(websocket: WebSocket) -> AgentCredentials | None:
         return None
 
     settings: Settings = websocket.app.state.settings
-    session_factory = request.app.state.session_factory
+    session_factory = websocket.app.state.session_factory
     async with session_factory() as session:
         creds = await AgentRepository(
             session, encryption_key=settings.agent_secret_encryption_key
@@ -126,7 +126,7 @@ async def _handle_frame(websocket: WebSocket, raw: str, *, creds: AgentCredentia
         )
         return
 
-    session_factory = request.app.state.session_factory
+    session_factory = websocket.app.state.session_factory
     async with session_factory() as session:
         agent_repo = AgentRepository(
             session, encryption_key=websocket.app.state.settings.agent_secret_encryption_key
@@ -149,20 +149,18 @@ async def _handle_frame(websocket: WebSocket, raw: str, *, creds: AgentCredentia
 
 
 @router.post("/agent/test-trade")
-async def test_trade(request: Request) -> dict:
+async def test_trade(request: Request) -> dict[str, object]:
     """TEMPORARY demo-only end-to-end execution test."""
+    from datetime import UTC, datetime
     from decimal import Decimal
     from uuid import UUID
-    from datetime import UTC, datetime
 
-    from app.domain.strategy.decision import (
-        Decision,
-        DecisionOutcome,
-        Direction,
-        Regime,
-    )
-    from app.execution.intent_service import submit_decision
+    from app.domain.execution.enums import ExecutionState
+    from app.domain.market.enums import Direction, Regime
+    from app.domain.strategy.decision import Decision
+    from app.domain.strategy.enums import DecisionOutcome
     from app.execution.dispatcher import OutboxDispatcher
+    from app.execution.intent_service import submit_decision
     from app.repositories.outbox import OutboxRepository
     from app.repositories.reconciliation import ReconciliationRepository
     from app.transport.ws_broker import WSAgentBroker
@@ -182,7 +180,9 @@ async def test_trade(request: Request) -> dict:
         account_repo = AccountRepository(session)
 
         from sqlalchemy import select
+
         from app.models.tables import Account
+
         account = await session.scalar(select(Account).where(Account.id == account_id))
         if account is None:
             return {"ok": False, "error": "ACCOUNT_NOT_FOUND"}
@@ -243,7 +243,7 @@ async def test_trade(request: Request) -> dict:
 
         await session.commit()
 
-        if result.risk_decision is not None and not result.risk_decision.approved:
+        if result.state is ExecutionState.RISK_BLOCKED:
             account.trading_enabled = False
             account.kill_switch_active = True
             await session.commit()
