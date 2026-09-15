@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.execution.enums import ExecutionState
 from app.domain.execution.intent import OrderIntent
 from app.domain.execution.state_machine import assert_transition
-from app.models.tables import ExecutionTransition, TradeIntent
+from app.models.tables import ExecutionTransition, Instrument, TradeIntent
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +26,24 @@ class IntentOrderDetails:
     stop_loss: Decimal
     take_profit: Decimal | None
     risk_amount: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class PendingIntentRecord:
+    """Just enough of a `SENT`/`UNKNOWN` trade_intent for reconciliation to
+    match it against the broker's own open positions - a plain dataclass,
+    never `app.execution.reconciliation.PendingIntent` directly:
+    `app.repositories` sits below `app.execution` in the import-linter
+    layering and may not import it."""
+
+    id: UUID
+    client_order_id: str
+    magic: int
+    symbol: str
+    side: str
+    volume: Decimal
+    created_at: datetime
+    state: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +174,34 @@ class TradeIntentRepository:
             raise LookupError(f"trade_intent {trade_intent_id} not found")
         return IntentOrderDetails(
             stop_loss=row.stop_loss, take_profit=row.take_profit, risk_amount=row.risk_amount
+        )
+
+    async def list_pending(self, account_id: UUID) -> tuple[PendingIntentRecord, ...]:
+        """`SENT`/`UNKNOWN` intents for reconciliation to match against the
+        broker's own open positions - `SENT` because it was dispatched but
+        no fill has confirmed it yet, `UNKNOWN` because the fill result was
+        never received (the exact SILENT-broker-fault case reconciliation
+        exists to resolve)."""
+        result = await self._session.execute(
+            select(TradeIntent, Instrument.symbol)
+            .join(Instrument, Instrument.id == TradeIntent.instrument_id)
+            .where(
+                TradeIntent.account_id == account_id,
+                TradeIntent.state.in_([ExecutionState.SENT.value, ExecutionState.UNKNOWN.value]),
+            )
+        )
+        return tuple(
+            PendingIntentRecord(
+                id=intent.id,
+                client_order_id=intent.client_order_id,
+                magic=intent.magic,
+                symbol=symbol,
+                side=intent.side,
+                volume=intent.volume,
+                created_at=intent.created_at,
+                state=intent.state,
+            )
+            for intent, symbol in result
         )
 
     async def list_transitions(
