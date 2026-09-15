@@ -74,6 +74,14 @@ engine and the position monitor both prefer this real, recently-reported
 spread over the bar-derived one whenever it's fresh, and a new
 `PRICE_STALE` execution guard now actually cancels dispatch if the cached
 quote is missing or too old, instead of silently trading on stale data.
+There's also now a real, authenticated REST API (`app/api/v1/`) for
+everything the operator would want to *see*: `/auth/*` (JWT login,
+refresh rotation, logout), `/accounts`, `/analysis-runs` (the decision
+journal, WAIT included), `/signals`, `/positions`, `/trades`, and
+`/telemetry/gate-rejections` ("why has the bot not traded"). This is the
+read half of `SPEC-09`'s Next.js terminal's API - the terminal itself,
+and every control endpoint (kill switch, close positions), are still
+unbuilt.
 **What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is not
 implemented on either side; `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED`
 (the other two Phase-5-dependent hard gates) aren't wired up yet even
@@ -91,7 +99,7 @@ full breakdown).
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
 | 5 MT5 bridge | 🟡 Connected, trading and managing positions autonomously - reconnection replay still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
-| 7 Terminal | Not started |
+| 7 Terminal | 🟡 Read-only API built (auth, decision journal, positions, trades, telemetry) - the Next.js UI and all controls still missing - see ADR |
 | 8 Demo, then live | Not started |
 
 ## Repository layout

@@ -1,6 +1,4 @@
-"""SPEC-10 Phase 0 acceptance: `/system/ready` returns 200 once DB and Redis
-are reachable. Exercised here as an ASGI request rather than a live socket
-(equivalent to what `make up` proves against a running container)."""
+"""SPEC-03 §7 acceptance for `/signals`."""
 
 from __future__ import annotations
 
@@ -9,16 +7,16 @@ import os
 import uuid
 from datetime import UTC, datetime
 
-import httpx
 import pytest
-from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.testclient import TestClient
 
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import create_app
 from app.models.tables import User
+from tests.integration.seed import SeededRefs, seed_minimal_refs, seed_signal
 
 pytestmark = pytest.mark.integration
 
@@ -72,7 +70,7 @@ def _clean_database_after_each_test():  # type: ignore[no-untyped-def]
     asyncio.run(_cleanup())
 
 
-async def _provision_user(settings: Settings) -> None:
+async def _provision(settings: Settings) -> tuple[SeededRefs, uuid.UUID]:
     engine = create_async_engine(settings.database_url)
     try:
         await _reset_database(engine)
@@ -91,79 +89,87 @@ async def _provision_user(settings: Settings) -> None:
                     updated_at=now,
                 )
             )
+            refs = await seed_minimal_refs(session)
+            signal_id = await seed_signal(
+                session, refs, reference=f"SIG-API-{uuid.uuid4().hex[:8]}"
+            )
             await session.commit()
+        return refs, signal_id
     finally:
         await engine.dispose()
 
 
-async def test_health_is_always_200() -> None:
-    app = create_app(_settings())
-    transport = ASGITransport(app=app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
-        app.router.lifespan_context(app),
-    ):
-        response = await client.get("/api/v1/system/health")
+def _login(client: TestClient) -> str:
+    response = client.post(
+        "/api/v1/auth/login", json={"email": "op@example.com", "password": _PASSWORD}
+    )
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    token: str = response.json()["access_token"]
+    return token
 
 
-async def test_ready_reports_database_and_redis_ok() -> None:
-    app = create_app(_settings())
-    transport = ASGITransport(app=app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
-        app.router.lifespan_context(app),
-    ):
-        response = await client.get("/api/v1/system/ready")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["ready"] is True
-    assert body["checks"]["database"] == "ok"
-    assert body["checks"]["redis"] == "ok"
-
-
-async def test_status_requires_auth() -> None:
-    app = create_app(_settings())
-    transport = ASGITransport(app=app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
-        app.router.lifespan_context(app),
-    ):
-        response = await client.get("/api/v1/system/status")
-    assert response.status_code == 401
-
-
-async def test_status_reports_global_trading_disabled_by_default() -> None:
+def test_list_signals_returns_the_seeded_signal() -> None:
     settings = _settings()
-    await _provision_user(settings)
+    refs, signal_id = asyncio.run(_provision(settings))
     app = create_app(settings)
-    transport = ASGITransport(app=app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
-        app.router.lifespan_context(app),
-    ):
-        login = await client.post(
-            "/api/v1/auth/login", json={"email": "op@example.com", "password": _PASSWORD}
-        )
-        token = login.json()["access_token"]
-        response = await client.get(
-            "/api/v1/system/status", headers={"Authorization": f"Bearer {token}"}
-        )
+
+    with TestClient(app) as client:
+        token = _login(client)
+        response = client.get("/api/v1/signals", headers={"Authorization": f"Bearer {token}"})
+
     assert response.status_code == 200
     body = response.json()
-    assert body["global_trading_enabled"] is False
-    assert "streams" in body
+    assert len(body) == 1
+    assert body[0]["id"] == str(signal_id)
+    assert body[0]["symbol"] == "XAUUSD"
+    assert body[0]["direction"] == "LONG"
 
 
-async def test_correlation_id_is_echoed_on_every_response() -> None:
-    app = create_app(_settings())
-    transport = ASGITransport(app=app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
-        app.router.lifespan_context(app),
-    ):
-        response = await client.get(
-            "/api/v1/system/health", headers={"X-Correlation-Id": "test-correlation-id"}
+def test_list_signals_filters_by_direction() -> None:
+    settings = _settings()
+    asyncio.run(_provision(settings))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        token = _login(client)
+        response = client.get(
+            "/api/v1/signals",
+            params={"direction": "SHORT"},
+            headers={"Authorization": f"Bearer {token}"},
         )
-    assert response.headers["X-Correlation-Id"] == "test-correlation-id"
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_get_signal_detail_with_no_linked_intent() -> None:
+    settings = _settings()
+    refs, signal_id = asyncio.run(_provision(settings))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        token = _login(client)
+        response = client.get(
+            f"/api/v1/signals/{signal_id}", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(signal_id)
+    assert len(body["take_profits"]) == 1
+    assert body["trade_intent_id"] is None
+    assert body["trade_intent_state"] is None
+
+
+def test_get_signal_404_for_unknown_id() -> None:
+    settings = _settings()
+    asyncio.run(_provision(settings))
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        token = _login(client)
+        response = client.get(
+            f"/api/v1/signals/{uuid.uuid4()}", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    assert response.status_code == 404

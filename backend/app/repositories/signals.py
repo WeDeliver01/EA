@@ -17,7 +17,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.market.enums import Direction
 from app.domain.strategy.decision import Decision, TakeProfit
 from app.domain.strategy.signal_ref import SignalRef
-from app.models.tables import Signal
+from app.models.tables import Instrument, Signal, TradeIntent
+
+
+@dataclass(frozen=True, slots=True)
+class SignalSummary:
+    id: UUID
+    account_id: UUID
+    instrument_id: UUID
+    symbol: str
+    direction: Direction
+    entry: Decimal
+    stop_loss: Decimal
+    confluence_score: Decimal
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SignalDetail:
+    id: UUID
+    account_id: UUID
+    instrument_id: UUID
+    symbol: str
+    strategy_version_id: UUID
+    direction: Direction
+    setup_kind: str
+    entry: Decimal
+    stop_loss: Decimal
+    take_profits: tuple[TakeProfit, ...]
+    confluence_score: Decimal
+    created_at: datetime
+    trade_intent_id: UUID | None
+    trade_intent_state: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,4 +164,81 @@ class SignalRepository:
                 created_at=row.created_at,
             )
             for row in result.scalars().all()
+        )
+
+    async def list_signals(
+        self,
+        *,
+        account_id: UUID | None = None,
+        direction: Direction | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 50,
+    ) -> tuple[SignalSummary, ...]:
+        stmt = select(Signal, Instrument.canonical_symbol).join(
+            Instrument, Signal.instrument_id == Instrument.id
+        )
+        if account_id is not None:
+            stmt = stmt.where(Signal.account_id == account_id)
+        if direction is not None:
+            stmt = stmt.where(Signal.direction == direction.value)
+        if since is not None:
+            stmt = stmt.where(Signal.created_at >= since)
+        if until is not None:
+            stmt = stmt.where(Signal.created_at <= until)
+        stmt = stmt.order_by(Signal.created_at.desc()).limit(limit)
+
+        result = await self._session.execute(stmt)
+        return tuple(
+            SignalSummary(
+                id=row.id,
+                account_id=row.account_id,
+                instrument_id=row.instrument_id,
+                symbol=symbol,
+                direction=Direction(row.direction),
+                entry=row.entry,
+                stop_loss=row.stop_loss,
+                confluence_score=row.confluence_score,
+                created_at=row.created_at,
+            )
+            for row, symbol in result.all()
+        )
+
+    async def get_detail(self, signal_id: UUID) -> SignalDetail | None:
+        """The originating signal plus its linked `TradeIntent`, if any -
+        one signal produces at most one intent (`submit_decision`'s own
+        idempotency key), so an outer join never fans out."""
+        stmt = (
+            select(Signal, Instrument.canonical_symbol, TradeIntent.id, TradeIntent.state)
+            .join(Instrument, Signal.instrument_id == Instrument.id)
+            .outerjoin(TradeIntent, TradeIntent.signal_id == Signal.id)
+            .where(Signal.id == signal_id)
+        )
+        result = await self._session.execute(stmt)
+        row_tuple = result.first()
+        if row_tuple is None:
+            return None
+        row, symbol, intent_id, intent_state = row_tuple
+        return SignalDetail(
+            id=row.id,
+            account_id=row.account_id,
+            instrument_id=row.instrument_id,
+            symbol=symbol,
+            strategy_version_id=row.strategy_version_id,
+            direction=Direction(row.direction),
+            setup_kind=row.setup_kind,
+            entry=row.entry,
+            stop_loss=row.stop_loss,
+            take_profits=tuple(
+                TakeProfit(
+                    level=Decimal(tp["level"]),
+                    fraction=Decimal(tp["fraction"]),
+                    r_multiple=Decimal(tp["r_multiple"]),
+                )
+                for tp in row.take_profits
+            ),
+            confluence_score=row.confluence_score,
+            created_at=row.created_at,
+            trade_intent_id=intent_id,
+            trade_intent_state=intent_state,
         )

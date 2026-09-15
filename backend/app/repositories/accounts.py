@@ -13,18 +13,19 @@ this MVP pass doesn't wire up (see docs/adr/0001-mvp-scope.md).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.market.symbol_spec import SymbolSpec
 from app.domain.portfolio.account_state import AccountState
 from app.domain.risk.limits import RiskLimits
 from app.domain.risk.state import RiskState
-from app.models.tables import Account, Instrument, PositionRow, RiskProfile, Trade
+from app.models.tables import Account, Broker, Instrument, PositionRow, RiskProfile, Trade
 from app.repositories.mappers import (
     account_row_to_domain,
     instrument_row_to_spec,
@@ -34,9 +35,116 @@ from app.repositories.mappers import (
 _ACCOUNT_STALE_SECONDS = 10
 
 
+@dataclass(frozen=True, slots=True)
+class AccountSummary:
+    id: UUID
+    label: str
+    broker_name: str
+    environment: str
+    currency: str
+    balance: Decimal
+    equity: Decimal
+    trading_enabled: bool
+    kill_switch_active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AccountDetail:
+    id: UUID
+    label: str
+    broker_name: str
+    environment: str
+    currency: str
+    balance: Decimal
+    equity: Decimal
+    trading_enabled: bool
+    kill_switch_active: bool
+    mt5_login: int
+    leverage: int
+    agent_connected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolExposure:
+    symbol: str
+    open_risk: Decimal
+    open_position_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureSummary:
+    total_open_risk: Decimal
+    by_symbol: tuple[SymbolExposure, ...]
+
+
 class AccountRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def list_accounts(self) -> tuple[AccountSummary, ...]:
+        stmt = select(Account, Broker.name).join(Broker, Account.broker_id == Broker.id)
+        result = await self._session.execute(stmt)
+        return tuple(
+            AccountSummary(
+                id=row.id,
+                label=row.label,
+                broker_name=broker_name,
+                environment=row.environment,
+                currency=row.currency,
+                balance=row.balance,
+                equity=row.equity,
+                trading_enabled=row.trading_enabled,
+                kill_switch_active=row.kill_switch_active,
+            )
+            for row, broker_name in result.all()
+        )
+
+    async def get_account_detail(
+        self, account_id: UUID, *, agent_connected: bool
+    ) -> AccountDetail | None:
+        stmt = (
+            select(Account, Broker.name)
+            .join(Broker, Account.broker_id == Broker.id)
+            .where(Account.id == account_id)
+        )
+        result = await self._session.execute(stmt)
+        row_pair = result.one_or_none()
+        if row_pair is None:
+            return None
+        row, broker_name = row_pair
+        return AccountDetail(
+            id=row.id,
+            label=row.label,
+            broker_name=broker_name,
+            environment=row.environment,
+            currency=row.currency,
+            balance=row.balance,
+            equity=row.equity,
+            trading_enabled=row.trading_enabled,
+            kill_switch_active=row.kill_switch_active,
+            mt5_login=row.mt5_login,
+            leverage=row.leverage,
+            agent_connected=agent_connected,
+        )
+
+    async def compute_exposure(self, account_id: UUID) -> ExposureSummary:
+        stmt = (
+            select(
+                Instrument.canonical_symbol,
+                func.coalesce(func.sum(PositionRow.initial_risk), 0),
+                func.count(PositionRow.id),
+            )
+            .join(Instrument, PositionRow.instrument_id == Instrument.id)
+            .where(PositionRow.account_id == account_id, PositionRow.status == "OPEN")
+            .group_by(Instrument.canonical_symbol)
+        )
+        result = await self._session.execute(stmt)
+        by_symbol = tuple(
+            SymbolExposure(symbol=symbol, open_risk=Decimal(risk), open_position_count=count)
+            for symbol, risk, count in result.all()
+        )
+        total = sum((s.open_risk for s in by_symbol), Decimal(0))
+        return ExposureSummary(total_open_risk=total, by_symbol=by_symbol)
 
     async def load_account_state(self, account_id: UUID, *, as_of: datetime) -> AccountState:
         row = await self._session.get(Account, account_id)

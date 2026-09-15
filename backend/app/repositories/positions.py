@@ -134,6 +134,37 @@ class PositionRepository:
         result = await self._session.execute(stmt)
         return tuple(position_row_to_domain(row, symbol=symbol) for row, symbol in result.all())
 
+    async def list_positions(
+        self, account_id: UUID, *, status: str | None = None
+    ) -> tuple[Position, ...]:
+        """SPEC-03 §7: `GET /positions?account_id&status` - `status=None`
+        returns every position regardless of state (open and closed), not
+        just open ones (`list_open` above already covers that narrower
+        case for the execution path)."""
+        stmt = (
+            select(PositionRow, Instrument.canonical_symbol)
+            .join(Instrument, PositionRow.instrument_id == Instrument.id)
+            .where(PositionRow.account_id == account_id)
+        )
+        if status is not None:
+            stmt = stmt.where(PositionRow.status == status)
+        stmt = stmt.order_by(PositionRow.opened_at.desc())
+        result = await self._session.execute(stmt)
+        return tuple(position_row_to_domain(row, symbol=symbol) for row, symbol in result.all())
+
+    async def get_by_id(self, position_id: UUID) -> Position | None:
+        stmt = (
+            select(PositionRow, Instrument.canonical_symbol)
+            .join(Instrument, PositionRow.instrument_id == Instrument.id)
+            .where(PositionRow.id == position_id)
+        )
+        result = await self._session.execute(stmt)
+        row_pair = result.one_or_none()
+        if row_pair is None:
+            return None
+        row, symbol = row_pair
+        return position_row_to_domain(row, symbol=symbol)
+
     async def list_open_for_management(self, account_id: UUID) -> tuple[ManagedPosition, ...]:
         stmt = (
             select(PositionRow, Instrument.canonical_symbol, TradeIntent.signal_id)

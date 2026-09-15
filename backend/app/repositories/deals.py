@@ -79,6 +79,19 @@ class DealRepository:
         result = await self._session.execute(stmt)
         return tuple(deal_row_to_fill(row, symbol=symbol) for row, symbol in result.all())
 
+    async def list_for_position(
+        self, account_id: UUID, broker_position_id: str
+    ) -> tuple[Fill, ...]:
+        stmt = (
+            select(Deal, Instrument.canonical_symbol)
+            .join(Instrument, Deal.instrument_id == Instrument.id)
+            .where(Deal.account_id == account_id, Deal.broker_position_id == broker_position_id)
+            .order_by(Deal.executed_at)
+            .options(selectinload(Deal.trade_intent))
+        )
+        result = await self._session.execute(stmt)
+        return tuple(deal_row_to_fill(row, symbol=symbol) for row, symbol in result.all())
+
     async def rebuild_projections(
         self, account_id: UUID
     ) -> tuple[list[_PositionProjection], list[_TradeProjection]]:

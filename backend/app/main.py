@@ -7,11 +7,19 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.errors import install_error_handlers
+from app.api.v1.accounts import router as accounts_router
 from app.api.v1.agent_ws import router as agent_ws_router
+from app.api.v1.analysis import router as analysis_router
+from app.api.v1.auth import router as auth_router
+from app.api.v1.positions import router as positions_router
+from app.api.v1.signals import router as signals_router
 from app.api.v1.system import router as system_router
+from app.api.v1.telemetry import router as telemetry_router
+from app.api.v1.trades import router as trades_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import make_redis_client
@@ -79,9 +87,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Correlation-Id"] = request.state.correlation_id
         return response
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     install_error_handlers(app)
     app.include_router(system_router, prefix="/api/v1")
     app.include_router(agent_ws_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(accounts_router, prefix="/api/v1")
+    app.include_router(analysis_router, prefix="/api/v1")
+    app.include_router(signals_router, prefix="/api/v1")
+    app.include_router(positions_router, prefix="/api/v1")
+    app.include_router(trades_router, prefix="/api/v1")
+    app.include_router(telemetry_router, prefix="/api/v1")
 
     return app
 

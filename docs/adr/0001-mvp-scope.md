@@ -849,6 +849,80 @@ a live `StructureEngine` re-run) and the emergency-spread-widen check
 now exists via the quote cache, but nothing evaluates it for this
 purpose yet).
 
+### Phase 7 / the portal read API (partial)
+
+The operator asked to be able to see the whole system - the decision
+journal (including WAIT), open positions, trade history, gate telemetry -
+from a browser, not just `psql` on the VPS. That's `SPEC-09` (a Next.js
+terminal) and the API surface it depends on, `SPEC-03`. The terminal
+itself isn't built yet; this pass built the read half of the API it needs
+to talk to, since nothing in `app/api/v1/` existed beyond
+`/system/health`/`/system/ready`/`/agent/ws` before it.
+
+- **`app/core/security.py` and the schema already had everything auth
+  needed** - `User`, `RefreshToken` (with rotation support:
+  `token_hash`, `revoked_at`, `replaced_by`) and `AuditLog` tables, plus
+  `hash_password`/`verify_password` (Argon2id) and
+  `encode_access_token`/`decode_access_token` (JWT) - all present since
+  Phase 1 but never wired to an endpoint. `app/api/v1/auth.py` (`POST
+  /auth/login`, `/auth/refresh`, `/auth/logout`, `GET /auth/me`) is the
+  first thing that actually calls them. Refresh rotates on every use -
+  the presented token is revoked and linked via `replaced_by` to the new
+  one, so a stolen, already-used refresh token stops working the moment
+  the legitimate client refreshes again.
+- **TOTP deferred, deliberately.** `SPEC-03` §2 makes it mandatory only
+  for the `operator` role on a `live` account, enforced at the
+  trading-control endpoints (§4), which aren't built - so `login`'s
+  `totp` field is accepted for wire-compatibility and currently ignored.
+  Closing this is tied to building those control endpoints, not to auth
+  in isolation.
+- **`app/api/v1/deps.py`**: `get_current_user`/`get_session`, a second,
+  separate dependency chain from `agent_ws.py`'s HMAC one - SPEC-03 §10's
+  "human JWTs are rejected on `/agent/*`. Agent keys are rejected
+  everywhere else. Enforce with two distinct dependency chains, not a
+  shared one with a role check," which this repository's `/agent/*` route
+  already followed on the agent side; this is the human side of that same
+  rule.
+- **Six read endpoint groups**, each backed by new or extended repository
+  methods (never raw queries in the router - matches this codebase's
+  existing rule that repositories translate rows to domain objects,
+  routers never touch `app.models`): accounts (`AccountRepository.
+  list_accounts`/`get_account_detail`/`compute_exposure`, plus
+  `AgentConnectionRegistry.is_connected` for live agent status), the
+  decision journal (`AnalysisRunRepository.list_runs`/`get_detail` - WAIT
+  outcomes included, per P3), signals, positions (open and closed, not
+  just the execution path's `list_open`), a new `TradeRepository` for
+  closed trade history, and gate telemetry
+  (`AnalysisRunRepository.compute_gate_rejections`, answering "why has
+  the bot not traded" with one aggregate query per SPEC-03 §8).
+  `/system/status` was extended from a stub (git sha only) to include
+  Redis stream depths, scheduler state, and - when `account_id` is
+  given - live agent connectivity and unresolved discrepancy count; it
+  now requires auth like every other operator-facing read (`/health` and
+  `/ready` stay open, for infra probes).
+- **A real, previously-latent bug found while building this**:
+  `positions.signal_id` (see "Phase 5 / the position monitor" above) -
+  the same never-written column would have made a naive `/positions`
+  listing silently omit which signal originated a position, for every
+  position, forever. The read endpoints here don't expose `signal_id`
+  from the position row at all for this reason; `GET /signals/{id}`
+  exposes the relationship from the correct side instead (via
+  `trade_intents.signal_id`).
+- **CORS added to `app/main.py`** (`CORSMiddleware`, origins from the
+  existing `CORS_ORIGINS` setting) - dead code until now, since nothing
+  needed a browser origin allow-listed before a browser-facing frontend
+  was on the roadmap.
+
+Not built in this pass: the Next.js terminal itself (`SPEC-09` - routes,
+the dark/dense design system, TradingView charts, the WebSocket
+real-time layer); the trading-control endpoints (`SPEC-03` §4 - kill
+switch, close-all, enable/disable trading - all TOTP-gated and
+audit-logged, deliberately left for a separate, more carefully reviewed
+pass given what they can do); `/strategy`, `/research`, `/risk`,
+`/audit`, `/settings` routes and their backing endpoints; and TLS/nginx
+in front of any of this (the VPS's `api` service is still bound
+`0.0.0.0:8000` directly - see "Phase 5 / connecting the two halves").
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
@@ -862,8 +936,10 @@ don't, and reconnection replay itself is still unbuilt); the MQL5 `ea/`
 fallback; the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
 metrics, the nightly determinism replay job - a `position_monitor` loop
 for intra-candle position management now exists, see "Phase 5 / the
-position monitor"); the Next.js `frontend/` terminal (including any
-HTML/PDF rendering of the research report); and the
+position monitor"); the Next.js `frontend/` terminal itself, the
+trading-control endpoints, and TOTP (the read half of its API now
+exists - see "Phase 7 / the portal read API (partial)"; any HTML/PDF
+rendering of the research report is still unbuilt regardless); and the
 demo/live measurement phases. `infra/` has a working dev
 `docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
 production compose file; the scheduler runs inside the existing `api`
@@ -902,6 +978,13 @@ production compose file.
   `positions.signal_id` was schema-present but write-never, which would
   have made any naive query for "positions with a signal to manage
   against" find nothing at all in production.
+- The operator can now authenticate as a real user and read back the
+  entire trading history through a real API - the decision journal (WAIT
+  included), signals, open and closed positions, closed trades, and gate
+  telemetry - all previously only inspectable via `psql` on the VPS. The
+  Next.js terminal that will actually render this for a browser isn't
+  built yet, and neither is anything that lets that operator *act*
+  (kill switch, close positions) - this pass is read-only, deliberately.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and
