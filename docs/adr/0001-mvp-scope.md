@@ -37,9 +37,22 @@ implemented.
 **Update:** once a Windows host with a live MT5 terminal and an FTMO demo
 account became available, the MT5-facing half of **Phase 5 (the MT5
 bridge)** was also built and verified live - see "Phase 5 / MT5 bridge
-(partial)" below. The WSS transport to a real backend is still untested,
-since no backend is deployed anywhere reachable from that host yet - the
-platform is still not connected to a broker end to end.
+(partial)" below.
+
+**Update 2:** the backend is now deployed (a separate Ubuntu VPS, Docker
+Compose) and the Windows agent has connected to it over a real, live
+socket - the HMAC handshake, envelope codec, and command/reply
+correlation are no longer just tested in isolation, they've been observed
+working against each other. A real `command.place_order` sent from the
+deployed backend was received by the live agent, forwarded to the actual
+MT5 terminal, and its broker-level reply (`retcode=10016`, "Invalid
+stops" - the order was rejected for a stale stop-loss level, not a
+plumbing failure) was correlated back to the waiting dispatcher
+correctly. See "Phase 5 / connecting the two halves" below for what that
+surfaced and fixed. The platform is now connected to a broker end to end;
+what it still can't do is originate that trade on its own (no scheduler
+calls `dispatch_pending` outside a test) or survive a disconnect (no
+reconnection replay).
 
 ### Why this boundary specifically
 
@@ -515,6 +528,77 @@ processes to agree on a worse contract than the one already written down.
   same agent at once - true today (nothing issues concurrent ones) but
   worth knowing if that ever changes.
 
+### Phase 5 / connecting the two halves
+
+The backend was deployed to a separate Ubuntu VPS via `infra/docker-compose.yml`
+(the `api` service bound to `0.0.0.0:8000` rather than `127.0.0.1` only -
+this trades a hardened default for actually being reachable from the
+Windows host; a production deployment should restrict this at the
+firewall to the agent's IP, or put TLS/nginx in front of it, neither of
+which exists yet). `scripts/provision_agent.py` was added so
+`AgentRepository.create()` - built and unit-tested in the previous phase
+but never actually invoked outside a test - could be run for real,
+printing a complete `agent/.env` block (env var names matching
+`agent/config.py`'s `env_prefix="AGENT_"`, which the first version of
+this script got wrong: it printed `AGENT_ID` instead of `AGENT_AGENT_ID`
+and omitted `AGENT_ACCOUNT_ID`/`AGENT_BACKEND_WS_URL` entirely - fixed
+before it reached the Windows host).
+
+Connecting the two halves surfaced four bugs, none of which either side's
+existing tests caught because none of them exercise both halves against
+each other:
+
+- **A commit pushed directly from the VPS** while wiring up a manual
+  demo-trade test (`agent_ws.py`'s `_authenticate`/`_handle_frame`)
+  referenced an undefined `request` variable where `websocket` was
+  needed - the WS route has no `Request` object. This would have
+  `NameError`'d on every real agent connection attempt; caught by reading
+  the pulled diff before it was ever run, not by CI (ruff doesn't catch an
+  undefined name used inside a function that also has other, defined,
+  similarly-named objects in scope) or by a test (nothing exercises this
+  route with a real socket end to end in that PR).
+- **The agent's `correlation_id` fix (`ef8f9a5`) was on this branch but
+  not on the Windows host's checkout.** The first real `place_order`
+  round trip sent the command, and the agent executed it and replied -
+  but the reply arrived with no `correlation_id`, so the backend routed
+  it as an unrecognised unsolicited event (`agent_ws.unhandled_event`)
+  instead of resolving the dispatcher's pending future, which timed out
+  and recorded the intent as `UNKNOWN`. Not a code bug on either side by
+  the time this was diagnosed - a stale deployment on one of two
+  independently-updated machines. `git pull` + restart on the Windows
+  host was the fix; the *lesson* is that a fix living on `main` isn't a
+  fix until every place that runs the code has it.
+- **`/agent/test-trade`'s hardcoded `signal_id`** (all-zeros-except-a-1)
+  was never a real row - `trade_intents.signal_id` is a live FK to
+  `signals`. Fixed by having the endpoint create the minimal
+  `analysis_run -> signal` chain itself (mirroring
+  `tests/integration/seed.py`'s shape) before calling `submit_decision`.
+  Two more constraint violations surfaced immediately behind this one and
+  were fixed the same way, before either could burn another round trip
+  against the live agent: `analysis_runs.market_snapshot` is `NOT NULL`
+  with no default, and `analysis_runs.mode` has a `CHECK` constraint
+  (`live`/`paper`/`backtest`/`replay` - `"demo"` isn't one of them).
+- **Once all of the above were fixed, the real round trip worked
+  end-to-end on the first genuine attempt**: `WSAgentBroker` sent
+  `command.place_order`, `agent/executor.py` called the real
+  `MT5Client.place_order` against the FTMO-Demo account, MT5 rejected it
+  (`retcode=10016`, "Invalid stops" - the endpoint's hardcoded stop-loss
+  level is stale relative to the current market price, since XAUUSD has
+  moved since whoever wrote that endpoint chose those numbers), and that
+  real, correlated `OrderResult` landed back in the dispatcher's
+  `DispatchOutcome`. No test anywhere had ever exercised this path with
+  two real, separately-deployed processes and a real broker in between;
+  this is the first time it has been observed working.
+
+The endpoint's hardcoded price levels are still stale and would need
+updating (or a live quote source, which doesn't exist yet - see
+`app/transport/event_router.py`'s "everything else is logged and
+dropped" for `event.quote`) to actually produce a filled order rather
+than a broker-level rejection. That's a fidelity gap in a
+`TEMPORARY demo-only` endpoint, not a gap in Phase 5 itself: the
+plumbing this phase exists to prove - authenticate, dispatch, execute,
+reply, correlate - is what the `retcode=10016` response demonstrates.
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
@@ -547,22 +631,24 @@ there's still nothing running in `workers/` yet to put behind it.
   it could produce today would be about synthetic bars, not XAUUSD. The
   next real increment for the research question is running it against
   actual historical data with a persistence layer, not more in-memory code.
-- Both halves of Phase 5 now exist and are independently real: `agent/`
-  can place, modify, close and read orders/positions/deals against an
-  actual FTMO-Demo account through the actual `MetaTrader5` package, and
-  `app/transport/` can authenticate a real WebSocket handshake, dispatch a
-  command, correlate its reply, and ingest heartbeats and deals - all
-  against real Postgres and Redis. `app/execution/`'s design held up
-  exactly as promised: nothing in the dispatcher, event consumer, position
-  manager or reconciler needed to change to plug in a real, network-backed
-  broker instead of the simulated one. What's still missing is the join:
-  a backend deployed somewhere the Windows host can reach, `agent/`
-  pointed at it with real credentials from `AgentRepository.create()`,
-  and a first real command/reply round trip over an actual socket - until
-  that happens, "the two halves talk to each other" is still a design
-  claim, not an observed fact. Also still missing: a scheduler that calls
-  `dispatch_pending`/`Reconciler.run` on its own (nothing outside a test
-  ever has), and reconnection replay on either side.
+- Both halves of Phase 5 are now not just independently real but
+  connected: `agent/` places, modifies, closes and reads orders,
+  positions and deals against an actual FTMO-Demo account through the
+  actual `MetaTrader5` package; `app/transport/`, deployed on a real
+  Ubuntu VPS, authenticates the live agent's WebSocket handshake,
+  dispatches a command, correlates its reply, and ingests heartbeats and
+  deals - against real Postgres and Redis, over a real socket, to a real
+  broker. `app/execution/`'s design held up exactly as promised: nothing
+  in the dispatcher, event consumer, position manager or reconciler
+  needed to change to plug in the real, network-backed `WSAgentBroker`
+  instead of the simulated one. "The two halves talk to each other" is
+  now an observed fact, not a design claim - a real `place_order`
+  command/reply round trip has happened, end to end, including a genuine
+  broker-level rejection correlated correctly back to the caller. Still
+  missing: a scheduler that calls `dispatch_pending`/`Reconciler.run` on
+  its own (nothing outside a test or this one manual endpoint ever has),
+  and reconnection replay on either side - both remain exactly as
+  described in the Phase 5 sections above.
 - Before any of this trades real money, the deferred indicator/MT5
   verification (`SPEC-05` §5), the full golden-fixture set, the full
   `SPEC-07` §8 v1 experiment against real data, and the rest of Phase 5's

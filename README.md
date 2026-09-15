@@ -5,15 +5,18 @@ MT5 executes, PostgreSQL remembers every decision including every decision
 not to trade. Full design in [`docs/specs/`](docs/specs/) - start with
 [`SPEC-00-overview.md`](docs/specs/SPEC-00-overview.md).
 
-## Status: MVP build, Phases 0-4 of 8 done, Phase 5 partial
+## Status: MVP build, Phases 0-4 of 8 done, Phase 5 connected and round-trip proven
 
 This build covers **Foundation, Domain & persistence, the Strategy engine,
 the Research engine (backtester), and Paper execution** to their full
-acceptance criteria, plus both halves of **Phase 5 (the MT5 bridge)** -
-the MT5-facing half (`agent/`), live-verified on a separate Windows host
-against a real FTMO-Demo account, and the backend-facing half
-(`app/transport/`, the real WS gateway agents connect to), built and
-tested against real Postgres/Redis. See
+acceptance criteria, plus **Phase 5 (the MT5 bridge)**: the MT5-facing half
+(`agent/`, live-verified against a real FTMO-Demo account) and the
+backend-facing half (`app/transport/`, the real WS gateway agents connect
+to) are now deployed as two separate machines (a Windows host running MT5,
+an Ubuntu VPS running the backend) and connected over a real socket - a
+real `command.place_order` sent from the deployed backend was executed by
+the live agent against the real MT5 terminal, and its broker-level reply
+was correlated back correctly. See
 [`docs/adr/0001-mvp-scope.md`](docs/adr/0001-mvp-scope.md) for exactly what
 that means and every deviation from the spec, and
 [`docs/specs/SPEC-10-build-plan.md`](docs/specs/SPEC-10-build-plan.md) for
@@ -32,21 +35,24 @@ it dispatches, fills, opens a position, gets managed (breakeven, partial
 take-profits, ATR trailing, time exit), closes, and lands as a trade
 record - with idempotent, crash-recoverable dispatch (the outbox pattern)
 and a reconciler that never auto-closes a position it doesn't recognise.
-Separately again, `agent/mt5_client.py` can place, modify, close and read
-orders/positions/deals against a **real** MT5 terminal and a real broker
-demo account - live-verified, not simulated - and `app/transport/` can
-authenticate a real agent's WebSocket handshake, dispatch a command,
-correlate its reply, and ingest heartbeats and deals into the database.
-**What doesn't exist yet:** the two Phase 5 halves have never been
-connected to each other. No backend is deployed anywhere the Windows host
-can reach, so there has been no real command/reply round trip over an
-actual socket - `dispatcher.py`/`position_manager.py`/`reconciliation.py`
-can use `WSAgentBroker` instead of the simulated one with no code changes
-(that's the whole point of the `AsyncBroker` seam), but nothing has
-actually pointed them at it yet. `GLOBAL_TRADING_ENABLED` has no effect on
+`agent/mt5_client.py` can place, modify, close and read orders/positions/
+deals against a **real** MT5 terminal and a real broker demo account -
+live-verified, not simulated - and `app/transport/`, deployed on a real
+Ubuntu VPS, authenticates a real agent's WebSocket handshake, dispatches a
+command, correlates its reply, and ingests heartbeats and deals into the
+database. The two halves are now connected: a real `command.place_order`
+sent from the deployed backend was executed by the live agent against the
+real MT5 terminal, and a genuine broker-level reply (a rejection, in the
+one attempt made so far - see the ADR) was correlated back to the waiting
+caller correctly. `dispatcher.py`/`position_manager.py`/`reconciliation.py`
+use `WSAgentBroker` instead of the simulated one with no code changes
+(that's the whole point of the `AsyncBroker` seam).
+**What doesn't exist yet:** `GLOBAL_TRADING_ENABLED` has no effect on
 anything, and there's no scheduler that calls `dispatch_pending`/
-`Reconciler.run` on its own - both remain test-only entry points (see the
-ADR for the full breakdown).
+`Reconciler.run` on its own - both remain test-only (or one-off manual
+endpoint) entry points; nothing has originated a trade on its own timer.
+Reconnection replay (SPEC-04 §7.2-§7.4) is also not implemented on either
+side (see the ADR for the full breakdown).
 
 | Phase | Status |
 |---|---|
@@ -55,7 +61,7 @@ ADR for the full breakdown).
 | 2 Strategy engine | ✅ Done |
 | 3 Research engine | ✅ Done (synthetic data only - see ADR) |
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
-| 5 MT5 bridge | 🟡 Partial - both halves built and tested independently, never connected - see ADR |
+| 5 MT5 bridge | 🟡 Connected, round trip proven - scheduler and reconnection replay still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
 | 7 Terminal | Not started |
 | 8 Demo, then live | Not started |
@@ -165,35 +171,39 @@ finished:
 ## Next steps
 
 Per `SPEC-10`, the current build increment is **Phase 5 (the MT5 bridge)**.
-Both halves now exist independently - `agent/mt5_client.py` live-verified
-against an FTMO-Demo account, `app/transport/` tested against real
-Postgres/Redis with a real WebSocket handshake - but they have never been
-connected to each other. What's left to finish Phase 5:
+Both halves are now deployed as two separate machines and connected -
+`agent/mt5_client.py` live-verified against an FTMO-Demo account,
+`app/transport/` deployed on an Ubuntu VPS and handshaking with the real
+agent over a real socket, and a real `command.place_order`/reply round
+trip has been observed end to end (see the ADR). What's left to finish
+Phase 5:
 
-1. **Deploy the backend somewhere the agent can reach it** - a Windows host
-   running MT5 and a Linux host running this backend need to be two
-   separate machines connected over a network (`MetaTrader5` is
-   Windows-only and IPC-based; it can't run on Linux). Nothing below this
-   can be fully validated without it.
-2. **Provision real agent credentials** via `AgentRepository.create()` and
-   configure them into the Windows host's `.env`, then run `agent/main.py
-   --enable-transport` pointed at the deployed backend's `/api/v1/agent/ws`
-   - the first real command/reply round trip over an actual socket.
-3. **Build a scheduler** that calls `OutboxDispatcher.dispatch_pending`
-   and `Reconciler.run` on an interval once an agent is connected - neither
-   has ever been called outside a test; this is a pre-existing gap from
-   Phase 4, not new, but it's what turns "a signal was approved" into "an
-   order was actually sent."
-4. **Implement reconnection replay** (SPEC-04 §7.2-§7.4) on both sides: on
+1. **Build a scheduler** that calls `OutboxDispatcher.dispatch_pending`
+   and `Reconciler.run` on an interval now that an agent is actually
+   connected - neither has ever been called outside a test or the one-off
+   `/agent/test-trade` endpoint; this is a pre-existing gap from Phase 4,
+   not new, but it's what turns "a signal was approved" into "an order was
+   actually sent" without a human hitting an endpoint by hand.
+2. **Implement reconnection replay** (SPEC-04 §7.2-§7.4) on both sides: on
    reconnect, replay the local event queue from the last acked `event_id`,
    then send a full position snapshot and a deal batch covering the
    disconnected window with 5-minute overlap. `agent/store.py` has the
    primitives (`unacked_events`/`ack_event`); nothing calls them yet.
-5. **Add tests for `agent/executor.py`, `watcher.py`, `heartbeat.py`,
+3. **Add tests for `agent/executor.py`, `watcher.py`, `heartbeat.py`,
    `health.py`, `main.py`** - currently wired but unverified beyond import
    and manual reasoning.
-6. **Rate limiting/backpressure** on the heartbeat and the `event.quote`
+4. **Rate limiting/backpressure** on the heartbeat and the `event.quote`
    throttle (SPEC-04 §5's 4/sec max) - not implemented on either side.
+5. **A live quote source**, so a real order can actually fill rather than
+   being rejected for a stale stop-loss level - `event.quote` is currently
+   logged and dropped (see the ADR); the one real order attempted so far
+   used a hardcoded price from whenever the demo endpoint was written and
+   was rejected by the broker (`retcode=10016`, "Invalid stops") because
+   the market has since moved.
+6. **Harden the deployment**: the VPS's `api` service is bound to
+   `0.0.0.0:8000` (reachable from anywhere, not just the agent's IP) to get
+   connected quickly - this needs a firewall rule scoped to the agent's IP
+   or TLS/nginx in front of it before this goes anywhere near real money.
 
 Two things remain open on the research side, independent of Phase 5:
 `SPEC-07` §8's v1 experiment needs to run against real XAUUSD history
