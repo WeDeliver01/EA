@@ -3,6 +3,7 @@ objects (SPEC-02 §6, P5)."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -11,9 +12,45 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.execution.intent import Position
-from app.models.tables import Instrument, PositionRow, Trade
+from app.domain.market.enums import Direction
+from app.models.tables import Instrument, PositionRow, Trade, TradeIntent
 from app.repositories.mappers import position_row_to_domain
 from app.repositories.projections import PositionProjection, TradeProjection
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedPosition:
+    """Everything `app.execution.position_manager.LivePosition` needs
+    besides `take_profits` (which lives on the originating `Signal`, not
+    the position row - see `position_manager.py`'s own module docstring),
+    for a position `position_monitor` can actually manage: one with both a
+    `signal_id` and an `initial_stop`. A position missing either (a manual
+    or orphaned trade with no recorded sizing decision) is left alone -
+    reconciliation, not this loop, is what notices and reports those.
+
+    `signal_id` comes from `trade_intents.signal_id` (a real, always-set FK
+    for any intent-originated position), not `positions.signal_id` - that
+    column exists in the schema but nothing in this codebase ever writes
+    it (positions are rebuilt from `deals` alone, P5, which carry no
+    signal reference), so filtering on it directly would silently match
+    zero real positions. `trade_intent_id` is what `apply_projections`
+    actually sets from deal data, and every intent has a signal."""
+
+    id: UUID
+    broker_position_id: str
+    account_id: UUID
+    instrument_id: UUID
+    symbol: str
+    direction: Direction
+    initial_volume: Decimal
+    remaining_volume: Decimal
+    entry_price: Decimal
+    initial_stop: Decimal
+    current_stop: Decimal
+    signal_id: UUID
+    partials_taken: int
+    breakeven_moved: bool
+    opened_at: datetime
 
 
 class PositionRepository:
@@ -96,6 +133,46 @@ class PositionRepository:
         )
         result = await self._session.execute(stmt)
         return tuple(position_row_to_domain(row, symbol=symbol) for row, symbol in result.all())
+
+    async def list_open_for_management(self, account_id: UUID) -> tuple[ManagedPosition, ...]:
+        stmt = (
+            select(PositionRow, Instrument.canonical_symbol, TradeIntent.signal_id)
+            .join(Instrument, PositionRow.instrument_id == Instrument.id)
+            .join(TradeIntent, PositionRow.trade_intent_id == TradeIntent.id)
+            .where(
+                PositionRow.account_id == account_id,
+                PositionRow.status == "OPEN",
+                PositionRow.initial_stop_loss.is_not(None),
+                PositionRow.stop_loss.is_not(None),
+            )
+        )
+        result = await self._session.execute(stmt)
+        managed: list[ManagedPosition] = []
+        for row, symbol, signal_id in result.all():
+            # Non-None by construction (the WHERE clause above), but the
+            # ORM's column types stay Optional - narrow explicitly for mypy.
+            assert row.initial_stop_loss is not None
+            assert row.stop_loss is not None
+            managed.append(
+                ManagedPosition(
+                    id=row.id,
+                    broker_position_id=row.broker_position_id,
+                    account_id=row.account_id,
+                    instrument_id=row.instrument_id,
+                    symbol=symbol,
+                    direction=Direction(row.direction),
+                    initial_volume=row.initial_volume,
+                    remaining_volume=row.volume,
+                    entry_price=row.entry_price,
+                    initial_stop=row.initial_stop_loss,
+                    current_stop=row.stop_loss,
+                    signal_id=signal_id,
+                    partials_taken=row.partials_taken,
+                    breakeven_moved=row.breakeven_moved,
+                    opened_at=row.opened_at,
+                )
+            )
+        return tuple(managed)
 
     async def get_id_by_broker_position_id(
         self, account_id: UUID, broker_position_id: str

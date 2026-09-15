@@ -1,8 +1,8 @@
 """The process that actually runs the trading loop continuously: candle-
 close detection -> strategy evaluation -> execution -> dispatch ->
-reconciliation, each on its own asyncio task, sharing the one
-`AgentConnectionRegistry` instance the FastAPI app's `/agent/ws` route
-already holds on `app.state`.
+position management -> reconciliation, each on its own asyncio task,
+sharing the one `AgentConnectionRegistry` instance the FastAPI app's
+`/agent/ws` route already holds on `app.state`.
 
 Runs inside the `api` process (started from `app.main`'s lifespan), not as
 a separate service: `WSAgentBroker`/`AgentConnectionRegistry` are
@@ -15,12 +15,14 @@ would just be unable to ever reach the agent.
 Single account/instrument for this MVP pass (`Settings.scheduler_*`) -
 matches this codebase's existing single-tenant assumptions elsewhere (one
 `AgentConnectionRegistry` entry per account, `WSAgentBroker` constructed
-per-account). `GLOBAL_TRADING_ENABLED` (default off) gates only the
-dispatch step - decisions are still recorded either way (P3), and
-existing intents still get created and queued, but nothing is actually
-sent to the broker while it's off. Every loop iteration is wrapped so one
-failure never kills the task - it logs and waits for the next tick,
-same as a real supervisor would restart it, just without the restart.
+per-account). `GLOBAL_TRADING_ENABLED` (default off) gates the dispatch
+step and the position-monitor loop - the two places this process can
+actually touch the broker (send an order, move a stop, close a
+position) - decisions are still recorded either way (P3), and existing
+intents still get created and queued, but nothing is sent to the broker
+while it's off. Every loop iteration is wrapped so one failure never
+kills the task - it logs and waits for the next tick, same as a real
+supervisor would restart it, just without the restart.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from app.repositories.reconciliation import ReconciliationRepository
 from app.repositories.trade_intents import TradeIntentRepository
 from app.services.execution_worker import CONSUMER_GROUP as EXECUTION_CONSUMER_GROUP
 from app.services.execution_worker import ExecutionWorker
+from app.services.position_monitor import PositionMonitorConfig, PositionMonitorLoop
 from app.services.reconciliation_worker import ReconciliationLoop
 from app.transport.registry import AgentConnectionRegistry
 from app.transport.ws_broker import WSAgentBroker
@@ -77,6 +80,7 @@ class SchedulerConfig:
     candle_close_grace_ms: int
     global_trading_enabled: bool
     quote_stale_seconds: int
+    position_monitor_interval_seconds: float
 
     @classmethod
     def from_settings(cls, settings: Settings) -> SchedulerConfig | None:
@@ -109,6 +113,7 @@ class SchedulerConfig:
             candle_close_grace_ms=settings.candle_close_grace_ms,
             global_trading_enabled=settings.global_trading_enabled,
             quote_stale_seconds=settings.quote_stale_seconds,
+            position_monitor_interval_seconds=float(settings.position_monitor_interval_seconds),
         )
 
 
@@ -141,6 +146,16 @@ class Scheduler:
             ],
             candle_close_grace=timedelta(milliseconds=config.candle_close_grace_ms),
         )
+        self._position_monitor = PositionMonitorLoop(
+            session_factory=session_factory,
+            redis=redis,
+            config=PositionMonitorConfig(
+                trade_construction=StrategyConfig().trade_construction,
+                atr_period=StrategyConfig().context.atr_period,
+                primary_tf=config.primary_tf,
+                quote_stale_seconds=config.quote_stale_seconds,
+            ),
+        )
         self._tasks: list[asyncio.Task[None]] = []
 
     def start(self) -> None:
@@ -149,6 +164,7 @@ class Scheduler:
             asyncio.create_task(self._strategy_loop(), name="scheduler.strategy"),
             asyncio.create_task(self._execution_loop(), name="scheduler.execution"),
             asyncio.create_task(self._dispatch_loop(), name="scheduler.dispatch"),
+            asyncio.create_task(self._position_monitor_loop(), name="scheduler.position_monitor"),
             asyncio.create_task(self._reconciliation_loop(), name="scheduler.reconciliation"),
         ]
         logger.info("scheduler.started", account_id=str(self._config.account_id))
@@ -243,6 +259,21 @@ class Scheduler:
             except Exception:
                 logger.exception("scheduler.dispatch_loop_error")
             await asyncio.sleep(self._config.outbox_dispatch_interval_seconds)
+
+    async def _position_monitor_loop(self) -> None:
+        while True:
+            try:
+                if self._config.global_trading_enabled:
+                    await self._position_monitor.run_for_account(
+                        account_id=self._config.account_id,
+                        instrument_id=self._config.instrument_id,
+                        symbol=self._config.symbol,
+                        broker=self._broker,
+                        as_of=datetime.now(UTC),
+                    )
+            except Exception:
+                logger.exception("scheduler.position_monitor_loop_error")
+            await asyncio.sleep(self._config.position_monitor_interval_seconds)
 
     async def _reconciliation_loop(self) -> None:
         loop = ReconciliationLoop(session_factory=self._session_factory)

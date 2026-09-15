@@ -42,6 +42,7 @@ async def test_start_and_stop_do_not_hang_or_raise(
         candle_close_grace_ms=1500,
         global_trading_enabled=False,
         quote_stale_seconds=5,
+        position_monitor_interval_seconds=0.05,
     )
     scheduler = Scheduler(
         session_factory=async_sessionmaker(db_engine, expire_on_commit=False),
@@ -51,7 +52,7 @@ async def test_start_and_stop_do_not_hang_or_raise(
     )
 
     scheduler.start()
-    assert len(scheduler._tasks) == 5  # whitebox: proves every loop actually started
+    assert len(scheduler._tasks) == 6  # whitebox: proves every loop actually started
     await asyncio.sleep(0.3)  # a few scheduling turns for each loop
     for task in scheduler._tasks:
         assert not task.done()  # still running its loop, not crashed out

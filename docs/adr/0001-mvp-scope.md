@@ -76,6 +76,14 @@ entry (falling back to the bar-derived one only when it doesn't), and a
 new `PRICE_STALE` execution guard cancels dispatch outright if that cache
 entry is missing or older than `QUOTE_STALE_SECONDS`.
 
+**Update 5:** a position-monitor loop now runs continuously alongside the
+rest of the scheduler (`app/services/position_monitor.py`) - see "Phase 5
+/ the position monitor" below. Breakeven moves, partial take-profits, ATR
+trailing and time-exit (`app/execution/position_manager.py`, built and
+tested since Phase 4 but never actually invoked outside a test) now
+happen on a live position between candle closes, gated by
+`GLOBAL_TRADING_ENABLED` like the rest of what touches the broker.
+
 ### Why this boundary specifically
 
 Phase 4 is the last phase whose acceptance criteria are self-contained:
@@ -776,6 +784,71 @@ same heartbeat now carries what they'd need (`terminal_connected`,
 `trade_allowed`, agent last-seen) - out of scope for this pass, a
 documented gap, not a silent one.
 
+### Phase 5 / the position monitor
+
+`app/execution/position_manager.py` (Phase 4: `decide()`, the pure
+stop/partial-TP/time-exit function, and `PositionManager.apply()`, its
+DB/broker-touching half) had been sitting fully built and fully tested
+since Phase 4, but nothing had ever actually called it outside a test -
+SPEC-06 §8's per-tick position management loop was the last major piece
+of the original scheduler plan still missing. Building it surfaced one
+real, pre-existing gap along the way:
+
+- **`positions.signal_id` is never written by anything.** It exists in
+  the schema and the domain `Position` object reads it, but positions are
+  rebuilt from `deals` alone (P5's projection design), and no deal carries
+  a signal reference - so a naive `WHERE signal_id IS NOT NULL` filter to
+  find "positions with an original sizing decision to manage against"
+  would have silently matched zero real positions, forever. The actual
+  signal reference a fill-originated position carries is reachable via
+  `positions.trade_intent_id -> trade_intents.signal_id` instead -
+  `trade_intent_id` **is** set by `apply_projections` from real deal data,
+  and `trade_intents.signal_id` is a non-nullable FK. Caught by writing an
+  integration test against a real, pipeline-opened position before
+  trusting the filter, rather than a hand-built `LivePosition` the way
+  Phase 4's own `position_manager` tests do (deliberately, to exercise
+  what production data actually looks like) - the first version of the
+  query (filtering on `positions.signal_id`) passed every existing test
+  in the repo and would still have found nothing in production.
+- **`app/repositories/positions.py`: `PositionRepository.
+  list_open_for_management()`.** Returns a new `ManagedPosition` per
+  open position that has both a resolvable `signal_id` (via the join
+  above) and a recorded `initial_stop_loss`/`stop_loss` - a manually
+  opened or otherwise orphaned position (no intent, no original stop)
+  has neither and is left alone, same as reconciliation already treats
+  those.
+- **`app/services/position_monitor.py`: `PositionMonitorLoop`.** Runs on
+  its own short interval (`POSITION_MONITOR_INTERVAL_SECONDS`, 2s by
+  default), independent of candle closes - the whole point of this loop
+  versus `strategy_worker`'s per-candle evaluation. Per account/symbol
+  tick: skip entirely if the live quote cache (`app.core.quotes`) has no
+  fresh entry - the same `QUOTE_STALE_SECONDS` bound `PRICE_STALE` uses,
+  since there's no safe management decision without a live price;
+  otherwise compute ATR directly from recently closed primary-timeframe
+  bars via the same pure `app.engines.indicators.atr.atr()` function
+  `ContextEngine` uses internally (called directly here rather than via a
+  full `MarketState` build, since this loop only needs the one number);
+  then run each managed position through the existing `decide()` and,
+  for anything but "none", `PositionManager.apply()` - a stop move, a
+  partial close, or a time exit, exactly as Phase 4 already built and
+  tested, now actually reachable outside a test. Lives in `app.services`
+  for the same reason `execution_worker`/`reconciliation_worker` do:
+  `position_manager` is in `app.execution`, and
+  `app.execution`/`app.workers` are mutually exclusive siblings under the
+  layering contract.
+- **Wired into `app/services/scheduler.py`** as a sixth asyncio task,
+  gated by `GLOBAL_TRADING_ENABLED` the same way the dispatch loop is -
+  this loop can modify a live stop or close a live position, a real
+  broker action, not just a recorded decision, so it stays off by default
+  along with everything else that touches the broker.
+
+Not implemented (inherited from `position_manager.py`'s own Phase 4
+documented gaps, unchanged by this pass): structural invalidation (needs
+a live `StructureEngine` re-run) and the emergency-spread-widen check
+(needs a live spread reading against a widening threshold - a live spread
+now exists via the quote cache, but nothing evaluates it for this
+purpose yet).
+
 ## What is deliberately not built
 
 Phase 3's own Stage 4 (parameter perturbation) and Stage 7 (cost
@@ -787,9 +860,10 @@ sides (listed above - a live quote cache exists now, see "Phase 5 / the
 live quote cache", but `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED` still
 don't, and reconnection replay itself is still unbuilt); the MQL5 `ea/`
 fallback; the rest of Phase 6 (kill-switch triggers, alerting, Prometheus
-metrics, the nightly determinism replay job, a `position_monitor` loop
-for intra-candle position management); the Next.js `frontend/` terminal
-(including any HTML/PDF rendering of the research report); and the
+metrics, the nightly determinism replay job - a `position_monitor` loop
+for intra-candle position management now exists, see "Phase 5 / the
+position monitor"); the Next.js `frontend/` terminal (including any
+HTML/PDF rendering of the research report); and the
 demo/live measurement phases. `infra/` has a working dev
 `docker-compose.yml` and a stub `nginx/`/`prometheus/` layout but no
 production compose file; the scheduler runs inside the existing `api`
@@ -820,6 +894,14 @@ production compose file.
   account/symbol - and a stale or missing one now actually blocks
   dispatch (`PRICE_STALE`) instead of silently trading on data nobody
   checked the age of.
+- An open position is now actively managed on its own timer rather than
+  only at the next candle close: breakeven moves, partial take-profits,
+  ATR trailing and time-exit all run continuously against the live quote
+  cache once `GLOBAL_TRADING_ENABLED` is on. Finding this loop's positions
+  also surfaced and fixed a real, previously-silent gap -
+  `positions.signal_id` was schema-present but write-never, which would
+  have made any naive query for "positions with a signal to manage
+  against" find nothing at all in production.
 - The research engine can score any strategy version given `Bar` data from
   anywhere, but nothing in `research/` persists a run to Postgres yet - the
   `research_datasets`, `backtest_runs`, `backtest_metrics` and

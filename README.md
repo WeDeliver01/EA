@@ -54,25 +54,33 @@ use `WSAgentBroker` instead of the simulated one with no code changes
 persists a signal when it says TRADE, `execution_worker` turns that
 signal into a risk-checked intent, and the existing `OutboxDispatcher`/
 `Reconciler` are now driven by a real scheduler loop instead of only a
-test or a manual endpoint - all five loops running as asyncio tasks
-inside the `api` process (see the ADR for why it can't be a separate
-service). `GLOBAL_TRADING_ENABLED` now actually gates the dispatch step
-(default off); `SCHEDULER_ACCOUNT_ID`/`SCHEDULER_INSTRUMENT_ID`/
-`SCHEDULER_STRATEGY_VERSION_ID`/`SCHEDULER_SYMBOL` (all unset by default)
-gate the scheduler starting at all. There's also now a live quote cache
-(`app/core/quotes.py`, Redis-backed) fed from `event.heartbeat`'s own
-`symbols` field - `agent/heartbeat.py` already reports a live bid/ask/time
-per watched symbol every beat, so no separate quote stream was needed.
-The strategy engine prefers this real, recently-reported spread over the
-bar-derived one whenever it's fresh, and a new `PRICE_STALE` execution
-guard now actually cancels dispatch if the cached quote is missing or too
-old, instead of silently trading on stale data.
+test or a manual endpoint, and a `position_monitor` loop
+(`app/services/position_monitor.py`) manages every open, signal-backed
+position - breakeven, partial take-profits, ATR trailing, time-exit - on
+its own short timer between candle closes, using `app/execution/
+position_manager.py` (built and tested since Phase 4, never actually
+invoked outside a test until now) - six loops total, all running as
+asyncio tasks inside the `api` process (see the ADR for why it can't be a
+separate service). `GLOBAL_TRADING_ENABLED` now actually gates the
+dispatch step and the position monitor - the two places this process can
+touch the broker (default off); `SCHEDULER_ACCOUNT_ID`/
+`SCHEDULER_INSTRUMENT_ID`/`SCHEDULER_STRATEGY_VERSION_ID`/
+`SCHEDULER_SYMBOL` (all unset by default) gate the scheduler starting at
+all. There's also now a live quote cache (`app/core/quotes.py`,
+Redis-backed) fed from `event.heartbeat`'s own `symbols` field -
+`agent/heartbeat.py` already reports a live bid/ask/time per watched
+symbol every beat, so no separate quote stream was needed. The strategy
+engine and the position monitor both prefer this real, recently-reported
+spread over the bar-derived one whenever it's fresh, and a new
+`PRICE_STALE` execution guard now actually cancels dispatch if the cached
+quote is missing or too old, instead of silently trading on stale data.
 **What doesn't exist yet:** reconnection replay (SPEC-04 §7.2-§7.4) is not
 implemented on either side; `AGENT_DISCONNECTED`/`BROKER_DISCONNECTED`
 (the other two Phase-5-dependent hard gates) aren't wired up yet even
-though the heartbeat now carries what they'd need; and `position_monitor`
-(intra-candle position management on its own timer) is still deferred
-(see the ADR for the full breakdown).
+though the heartbeat now carries what they'd need; and
+`position_manager.py`'s own Phase 4 gaps (structural invalidation, the
+emergency-spread-widen check) remain unimplemented (see the ADR for the
+full breakdown).
 
 | Phase | Status |
 |---|---|
@@ -81,7 +89,7 @@ though the heartbeat now carries what they'd need; and `position_monitor`
 | 2 Strategy engine | ✅ Done |
 | 3 Research engine | ✅ Done (synthetic data only - see ADR) |
 | 4 Paper execution | ✅ Done (simulated broker only - see ADR) |
-| 5 MT5 bridge | 🟡 Connected, trading autonomously with a live quote feed - reconnection replay and position_monitor still missing - see ADR |
+| 5 MT5 bridge | 🟡 Connected, trading and managing positions autonomously - reconnection replay still missing - see ADR |
 | 6 Reconciliation & safety | Partially done as part of Phase 4 - see ADR |
 | 7 Terminal | Not started |
 | 8 Demo, then live | Not started |
@@ -217,11 +225,13 @@ detect-decide-execute-reconcile loop continuously with no human involved
    predates the live quote cache and was never updated to use it); a real
    order attempted through it was rejected by the broker (`retcode=10016`,
    "Invalid stops") because the market had since moved.
-5. **`position_monitor`**: an intra-candle loop for position management
-   (breakeven, partials, trailing, time exit) independent of candle
-   closes - deferred; today position management only happens as part of
-   the synchronous `event.deal`/`event.heartbeat` handling already in
-   `app/transport/event_router.py`.
+5. **`position_manager.py`'s own remaining Phase 4 gaps**: structural
+   invalidation (needs a live `StructureEngine` re-run against current
+   context) and the emergency-spread-widen check (needs a live spread
+   evaluated against a widening threshold - a live spread now exists via
+   the quote cache, but nothing evaluates it for this purpose yet).
+   `position_monitor` itself (the loop that runs breakeven/partials/
+   trailing/time-exit on its own timer) is built now - see above.
 6. **Harden the deployment**: the VPS's `api` service is bound to
    `0.0.0.0:8000` (reachable from anywhere, not just the agent's IP) to get
    connected quickly - this needs a firewall rule scoped to the agent's IP
