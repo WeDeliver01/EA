@@ -84,7 +84,7 @@ class ConfluenceConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     bands: ConfluenceBands = ConfluenceBands()
-    minimum_to_trade: Decimal = Decimal("7.0")
+    minimum_to_trade: Decimal = Decimal("6.0")
 
 
 class TradeConstructionConfig(BaseModel):
