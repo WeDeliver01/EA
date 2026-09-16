@@ -449,7 +449,8 @@ class MT5Client:
             tick = mt5.symbol_info_tick(s.name)
             if tick is not None and tick.time > 0:
                 broker_now = datetime.fromtimestamp(tick.time, tz=UTC)
-                return broker_now - datetime.now(tz=UTC)
+                agent_now = datetime.now(tz=UTC).replace(microsecond=0)
+                return broker_now - agent_now
         return timedelta(0)
 
     def _get_position(self, ticket: int, attempts: int = 10) -> Any:
