@@ -145,6 +145,15 @@ class Scheduler:
                 )
             ],
             candle_close_grace=timedelta(milliseconds=config.candle_close_grace_ms),
+            # MarketScanner's own default (3) is only enough to detect a
+            # fresh close; build_market_state needs up to 300 bars per
+            # timeframe (its own default lookback) to find real structure/
+            # liquidity/manipulation evidence. MT5 already has this history
+            # cached locally regardless of how long the agent has been
+            # connected, so matching that count here means every scan keeps
+            # the DB's window full rather than only ever growing it 1-3 bars
+            # at a time from a cold start.
+            fetch_count=300,
         )
         self._position_monitor = PositionMonitorLoop(
             session_factory=session_factory,
