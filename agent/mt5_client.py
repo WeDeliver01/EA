@@ -105,20 +105,18 @@ class MT5Credentials:
 
 
 class MT5Client:
-    _OFFSET_CACHE_TTL = timedelta(minutes=5)
-
     def __init__(self, credentials: MT5Credentials | None = None) -> None:
         self._credentials = credentials or MT5Credentials()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
         self._lock = asyncio.Lock()
         self._connected = False
         self._cached_offset: timedelta | None = None
-        self._offset_cached_at: datetime | None = None
 
     async def connect(self) -> None:
         async with self._lock:
             await self._run(self._sync_connect)
             self._connected = True
+            self._cached_offset = None
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -449,21 +447,19 @@ class MT5Client:
         not agent-local time - queried without this offset, a broker running
         ahead of the agent silently excludes the most recent deals.
 
-        Cached for `_OFFSET_CACHE_TTL`: recomputing this on every call picked
-        up whichever tick happened to be current at that instant, and real
-        tick arrival times are sub-second and irregular - the resulting
-        jitter (a few hundred milliseconds either way, call to call) leaked
-        into every bar's computed `open_time`, which `market_scanner`'s
-        candle-close dedup compares for exact equality. A bar's true offset
-        from broker-server time doesn't meaningfully change from one poll to
-        the next, so treating it as a live value was the bug, not a feature.
+        Computed once per connection and cached for the rest of the session
+        (reset in `connect()`), not on a timer: a time-boxed cache still let
+        this drift in production - live tick arrival is sub-second and
+        irregular, so even a "recompute every 5 minutes" cache picks up a
+        slightly different instant each time it refreshes, and that noise
+        leaks into every bar's computed `open_time`, which `market_scanner`'s
+        candle-close dedup compares for exact equality. Broker-vs-agent clock
+        skew is a per-session constant in practice (it only changes across a
+        reconnect, if at all) - computing it once and never touching it again
+        until the next `connect()` removes the drift entirely instead of just
+        slowing it down.
         """
-        now = datetime.now(tz=UTC)
-        if (
-            self._cached_offset is not None
-            and self._offset_cached_at is not None
-            and now - self._offset_cached_at < self._OFFSET_CACHE_TTL
-        ):
+        if self._cached_offset is not None:
             return self._cached_offset
 
         symbols = [s for s in mt5.symbols_get() or () if s.visible] or mt5.symbols_get() or ()
@@ -471,11 +467,11 @@ class MT5Client:
             tick = mt5.symbol_info_tick(s.name)
             if tick is not None and tick.time > 0:
                 broker_now = datetime.fromtimestamp(tick.time, tz=UTC)
-                offset = broker_now - now.replace(microsecond=0)
+                agent_now = datetime.now(tz=UTC).replace(microsecond=0)
+                offset = broker_now - agent_now
                 self._cached_offset = offset
-                self._offset_cached_at = now
                 return offset
-        return self._cached_offset or timedelta(0)
+        return timedelta(0)
 
     def _get_position(self, ticket: int, attempts: int = 10) -> Any:
         """`positions_get` briefly returns empty right after another order on
